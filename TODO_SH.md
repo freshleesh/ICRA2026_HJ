@@ -8,6 +8,60 @@
 
 ---
 
+## Phase 15 — B-2: GB/Smart 이중 closed loop 통합 (2026-05-06)
+
+### 결정 사항
+- 우리가 처음부터 짚은 가장 큰 부채. `state_transitions.py` 의 `*_GBMode`/`*_SmartMode`
+  4개 함수가 거의 동일한 로직을 모드별로 복제하고 있었음.
+- **ModeContext dataclass + 통합 함수 2개** 패턴으로 단일화.
+- 호출자 변경 0 (기존 4 함수는 thin wrapper로 유지).
+
+### 새로 추가된 항목 (state_transitions.py)
+- `ModeContext` (frozen dataclass) — 6 필드로 모드 차이 캡슐화
+  (helper / base_state / base_wpnts_data / base_wpnts_msg / allow_dynamic_overtaking / close_threshold)
+- `_make_gb_context(sm)`, `_make_smart_context(sm)` — context factory
+- `_is_base_path_valid(ctx)` — base wpnts validity (GB는 항상 True, Smart는 check)
+- `NonObstacleTransition(sm, ctx, close)` — 통합 (priority: base / recovery / lostline)
+- `ObstacleTransition(sm, ctx, close)` — 통합 (priority: base / recovery / OT / TRAILING)
+
+### 4개 mode 함수 → thin wrapper
+```python
+def NonObstacleTransition_GBMode(sm, close_to_gb):
+    return NonObstacleTransition(sm, _make_gb_context(sm), close_to_gb)
+# (Smart, Obstacle도 동일)
+```
+
+### 검증
+- 신규 pytest 27개 (`test_state_transitions.py`) — 모든 분기 happy/edge case
+- 통합 후 67/67 통과 (40 path_checker + 27 transitions)
+- Docker 컨테이너 (`icra2026_sh`) 에서 노드 재시작 → `GB_TRACK ↔ TRAILING` 전이 재현 확인
+
+### 결과 요약
+| | Before (4 함수) | After |
+|---|---|---|
+| 줄 수 | 25 + 39 + 55 + 70 = 189 | ~110 (통합) + 4 wrapper |
+| 결정 로직 위치 | 4곳 분산 | 2곳 (GB/Smart 차이는 ctx 필드) |
+| 호출자 영향 | — | 0 (wrapper 호환) |
+
+---
+
+## Phase 16 — B-1 + B-4: 작은 정리 (2026-05-06)
+
+### B-1: states.py 죽은 주석 제거
+- 옛 Overtaking (line 17-25), TrailingAdaptive/Trailing (line 66-82) 주석 25줄 제거
+- HJ MODIFIED 마커 제거, docstring으로 의미 통합
+- 83줄 → 59줄
+
+### B-4: 활성 영역 pyflakes 잔여 정리
+- `state_helper_for_smart.py`: numpy, ObstacleArray, OTWpntArray, debug_log_on_change, DEBUG_LOGGING_ENABLED 제거
+- `state_transitions.py`: List, Wpnt, states 제거 (B-2 통합으로 더 이상 안 쓰임) + `global _debug_log_cache` 제거 + docstring 정리
+
+### 결과
+- **활성 state_machine 영역 모두 pyflakes 깨끗** (10개 파일)
+- pytest 67/67 통과 (회귀 없음)
+
+---
+
 ## ✅ 검증 결과 (2026-05-06)
 
 | 항목 | 결과 |
