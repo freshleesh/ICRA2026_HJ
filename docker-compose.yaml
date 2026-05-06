@@ -71,9 +71,21 @@ services:
       context: .
       dockerfile: .docker_utils/Dockerfile.nuc
       args:
-        - USER=${USER} 
+        - USER=${USER}
         - UID=${UID} # user id must be saved to an environment variable, can be done with `export UID=$(id -u)`
         - GID=${GID} # group id must be saved to an environment variable, can be done with `export GID=$(id -g)`
     image: race_stack_nuc_2nd_car
     depends_on:
       - base_x86_2nd_car
+
+  # SH: state_machine 검증 전용 minimal 이미지 (GLIL/Cartographer/Livox 제외).
+  # base_x86 의존 없음 — ros:noetic-robot 에서 직접 빌드.
+  sim_sh_x86:
+    build:
+      context: .
+      dockerfile: .docker_utils/Dockerfile.sim_sh.x86
+      args:
+        - USER=${USER}
+        - UID=${UID}
+        - GID=${GID}
+    image: race_stack_sim_sh
