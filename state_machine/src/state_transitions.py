@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Tuple, List
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Optional, Tuple, List
 
 from states_types import StateType
 import rospy
@@ -13,6 +14,75 @@ if TYPE_CHECKING:
 
 close_threshold_smart = 0.5
 # close_threshold_gb replaced with state_machine._get_adaptive_close_threshold() (speed-adaptive)
+
+
+# ============================================================================
+# Mode Strategy — GB / Smart 이중 closed loop 통합용 컨텍스트.
+# 각 모드의 차이점을 ModeContext 하나에 묶고, NonObstacle/ObstacleTransition
+# 통합 함수가 이를 받아 동일 로직으로 처리한다.
+# ============================================================================
+
+@dataclass(frozen=True)
+class ModeContext:
+    """Mode-specific data sources for unified transition functions.
+
+    Fields:
+        helper                    : decision 의 기준이 되는 객체 (state_machine 또는 smart_helper)
+        base_state                : 해당 모드의 기본 state (GB_TRACK 또는 SMART_STATIC)
+        base_wpnts_data           : base wpnts 컨테이너 (cur_gb_wpnts 또는 cur_smart_static_avoidance_wpnts)
+        base_wpnts_msg            : ROS 메시지 (Smart 만 — GB raceline 은 항상 valid 라 None)
+        allow_dynamic_overtaking  : dynamic OT 허용 여부 (Smart 모드에선 항상 False)
+        close_threshold           : close_to_raceline 체크용 임계 (모드별로 다름)
+    """
+    helper: Any
+    base_state: StateType
+    base_wpnts_data: Any
+    base_wpnts_msg: Optional[Any]
+    allow_dynamic_overtaking: bool
+    close_threshold: float
+
+
+def _make_gb_context(state_machine) -> ModeContext:
+    """GB 모드 context. helper=state_machine 자신, base=GB_TRACK/cur_gb_wpnts.
+
+    GB raceline 은 항상 valid 라 base_wpnts_msg=None (validity 체크 생략).
+    Dynamic OT 는 smart_static_active=False 일 때만 허용.
+    """
+    return ModeContext(
+        helper=state_machine,
+        base_state=StateType.GB_TRACK,
+        base_wpnts_data=state_machine.cur_gb_wpnts,
+        base_wpnts_msg=None,
+        allow_dynamic_overtaking=not state_machine.smart_static_active,
+        close_threshold=state_machine._get_adaptive_close_threshold(),
+    )
+
+
+def _make_smart_context(state_machine) -> ModeContext:
+    """Smart 모드 context. helper=smart_helper, base=SMART_STATIC/cur_smart_static_avoidance_wpnts.
+
+    Smart static path 는 동적으로 publish 되므로 base_wpnts_msg=smart_static_wpnts (validity 체크 필요).
+    Dynamic OT 는 Smart 모드에선 항상 비활성 (정책).
+    """
+    return ModeContext(
+        helper=state_machine.smart_helper,
+        base_state=StateType.SMART_STATIC,
+        base_wpnts_data=state_machine.cur_smart_static_avoidance_wpnts,
+        base_wpnts_msg=state_machine.smart_static_wpnts,
+        allow_dynamic_overtaking=False,
+        close_threshold=close_threshold_smart,
+    )
+
+
+def _is_base_path_valid(ctx: ModeContext) -> bool:
+    """base path 자체가 valid 한지.
+
+    GB: raceline 은 항상 valid (base_wpnts_msg is None).
+    Smart: smart_static_wpnts 가 fresh + on_spline 한지 helper 로 체크.
+    """
+    if ctx.base_wpnts_msg is None:
+        return True
+    return ctx.helper._check_latest_wpnts(ctx.base_wpnts_msg, ctx.base_wpnts_data)
 
 # ===== HJ ADDED: Debug logging helper - only logs when values change =====
 _debug_log_cache = {}
@@ -323,203 +393,108 @@ def SmartStaticTransition(state_machine: StateMachine) -> Tuple[StateType, State
 
 ##################################################################################################################
 ##################################################################################################################
+# ===== UNIFIED MODE TRANSITIONS — GB / Smart 통합 (B-2) =====
+#
+# 두 모드의 NonObstacle/Obstacle transition 을 ModeContext 로 묶어 단일 함수로 통합.
+# 기존 *_GBMode / *_SmartMode 함수는 thin wrapper 로 남아 호출자 변경 없음.
+
+def NonObstacleTransition(state_machine: StateMachine, ctx: ModeContext, close_to_base: bool) -> Tuple[StateType, StateType]:
+    """장애물 없는 경우의 transition (GB/Smart 통합).
+
+    Priority:
+        1. base path 진입 가능 → base_state
+           (GB: close 면 OK / Smart: wpnts valid 면 OK, close 무관)
+        2. recovery 가용 + on_spline → RECOVERY
+        3. fallback → LOSTLINE (wpnts_src=base_state)
+    """
+    helper = ctx.helper
+
+    # Priority 1: base 진입 — GB 는 close 만, Smart 는 wpnts validity
+    if ctx.base_wpnts_msg is None:
+        base_ok = close_to_base
+    else:
+        base_ok = _is_base_path_valid(ctx)
+    if base_ok:
+        return ctx.base_state, ctx.base_state
+
+    # Priority 2: recovery
+    if helper._check_latest_wpnts(state_machine.recovery_wpnts, state_machine.cur_recovery_wpnts):
+        if helper._check_on_spline(state_machine.cur_recovery_wpnts):
+            return StateType.RECOVERY, StateType.RECOVERY
+
+    # Priority 3: lostline (wpnts_src 는 base_state 로 — 외부에서 trajectory 가 base 따라감)
+    return StateType.LOSTLINE, ctx.base_state
+
+
+def ObstacleTransition(state_machine: StateMachine, ctx: ModeContext, close_to_base: bool) -> Tuple[StateType, StateType]:
+    """장애물 있는 경우의 transition (GB/Smart 통합).
+
+    Priority:
+        1. base path close + free (+ valid for Smart) → base_state
+        2. not close + recovery 가용 + free → RECOVERY
+        3. static_overtaking_mode → OVERTAKE
+        4. dynamic_overtaking_mode (allow_dynamic_overtaking=True 일 때만) → OVERTAKE
+        5. TRAILING:
+           - base 진입 가능 (GB: close, Smart: valid) → TRAILING + base_state
+           - recovery 가용 → TRAILING + RECOVERY
+           - fallback → TRAILING + base_state
+    """
+    helper = ctx.helper
+    base_path_free = helper._check_free_frenet(ctx.base_wpnts_data)
+    base_valid = _is_base_path_valid(ctx)
+
+    # Priority 1: base 진입 (close + free + valid)
+    if base_valid and close_to_base and base_path_free:
+        return ctx.base_state, ctx.base_state
+
+    # Priority 2: recovery (only if not close)
+    recovery_availability = False
+    if not close_to_base:
+        recovery_availability = helper._check_latest_wpnts(state_machine.recovery_wpnts, state_machine.cur_recovery_wpnts)
+        if recovery_availability and helper._check_free_frenet(state_machine.cur_recovery_wpnts):
+            return StateType.RECOVERY, StateType.RECOVERY
+
+    # Priority 3: overtaking
+    if helper._check_static_overtaking_mode():
+        return StateType.OVERTAKE, StateType.OVERTAKE
+    if ctx.allow_dynamic_overtaking and helper._check_overtaking_mode():
+        return StateType.OVERTAKE, StateType.OVERTAKE
+
+    # Priority 4: TRAILING — GB 는 close 면 base_state, Smart 는 valid 면 base_state
+    if ctx.base_wpnts_msg is None:
+        base_ok_for_trailing = close_to_base
+    else:
+        base_ok_for_trailing = base_valid
+    if base_ok_for_trailing:
+        return StateType.TRAILING, ctx.base_state
+    if recovery_availability:
+        return StateType.TRAILING, StateType.RECOVERY
+    # Fallback (GB 의 gb_path_free 분기 + Smart 의 fallback 모두 여기로 흘러감 — 결과 동일)
+    return StateType.TRAILING, ctx.base_state
+
+
+##################################################################################################################
+##################################################################################################################
 # ===== SMART MODE CLOSED LOOP - Only considers Smart Static path =====
 
 def NonObstacleTransition_SmartMode(state_machine: StateMachine, close_to_smart: bool) -> Tuple[StateType, StateType]:
-    """Handle no obstacles case in Smart Static mode
-
-    CLOSED LOOP: Only considers Smart Static path.
-    GB raceline is completely ignored.
-
-    Args:
-        close_to_smart: True if close to Smart Static path (already calculated with Fixed Frenet)
-    """
-    smart_helper = state_machine.smart_helper
-
-    wpnts_valid = smart_helper._check_latest_wpnts(
-        state_machine.smart_static_wpnts,
-        state_machine.cur_smart_static_avoidance_wpnts)
-
-    debug_log_on_change("NonObstacle_SMART",
-                       close=close_to_smart,
-                       wpnts_valid=wpnts_valid,
-                       num_wpnts=len(state_machine.cur_smart_static_avoidance_wpnts.list))
-
-    # Priority 1: Smart path available and close - use it
-    if wpnts_valid and close_to_smart:
-        # rospy.logwarn(f"[NonObstacle_Smart→SMART_STATIC] ✓ Valid & close")
-        return StateType.SMART_STATIC, StateType.SMART_STATIC
-
-    # Priority 2: Smart path valid but not close - stay in Smart, use recovery to return
-    if wpnts_valid:
-        # rospy.logwarn(f"[NonObstacle_Smart→SMART_STATIC] ✓ Valid (not close)")
-        return StateType.SMART_STATIC, StateType.SMART_STATIC
-
-    # Priority 3: Smart path invalid - use recovery to get back
-    if smart_helper._check_latest_wpnts(state_machine.recovery_wpnts, state_machine.cur_recovery_wpnts):
-        if smart_helper._check_on_spline(state_machine.cur_recovery_wpnts):
-            # rospy.logwarn(f"[NonObstacle_Smart→RECOVERY] Smart invalid, recovering")
-            return StateType.RECOVERY, StateType.RECOVERY
-
-    # Priority 4: No valid path - lost line (still return SMART_STATIC trajectory to stay in loop)
-    # rospy.logwarn(f"[NonObstacle_Smart→LOSTLINE] Lost line")
-    return StateType.LOSTLINE, StateType.SMART_STATIC
+    """Smart 모드 thin wrapper — 통합 NonObstacleTransition 호출."""
+    return NonObstacleTransition(state_machine, _make_smart_context(state_machine), close_to_smart)
 
 
 def ObstacleTransition_SmartMode(state_machine: StateMachine, close_to_smart: bool) -> Tuple[StateType, StateType]:
-    """Handle obstacles present case in Smart Static mode
-
-    CLOSED LOOP: Only considers Smart Static path with Fixed Frenet.
-    GB raceline and GB path free status are completely ignored.
-
-    Args:
-        close_to_smart: True if close to Smart Static path (already calculated with Fixed Frenet)
-    """
-    smart_helper = state_machine.smart_helper
-
-    wpnts_valid = smart_helper._check_latest_wpnts(
-        state_machine.smart_static_wpnts,
-        state_machine.cur_smart_static_avoidance_wpnts)
-    smart_path_free = smart_helper._check_free_frenet(state_machine.cur_smart_static_avoidance_wpnts)
-
-    # Check overtaking conditions
-    ot_mode = smart_helper._check_overtaking_mode()
-    static_ot_mode = smart_helper._check_static_overtaking_mode()
-
-    debug_log_on_change("Obstacle_SMART",
-                       close=close_to_smart,
-                       wpnts_valid=wpnts_valid,
-                       path_free=smart_path_free,
-                       ot_mode=ot_mode,
-                       static_ot=static_ot_mode,
-                       num_obs=len(smart_helper.cur_obstacles_in_interest))
-
-    # ===== HJ ADDED: Periodic debug logging when blocked =====
-    if not smart_path_free and not ot_mode and not static_ot_mode:
-        rospy.logwarn_throttle(2.0,
-            f"[DEBUG Obstacle_SMART BLOCKED] Path blocked but no overtaking! "
-            f"close={close_to_smart}, wpnts_valid={wpnts_valid}, "
-            f"static_ot={static_ot_mode}, ot={ot_mode}, num_obs={len(smart_helper.cur_obstacles_in_interest)}")
-    # ===== HJ ADDED END =====
-
-    # Priority 1: Smart path available, close, and free - use it
-    if wpnts_valid and close_to_smart and smart_path_free:
-        return StateType.SMART_STATIC, StateType.SMART_STATIC
-
-    # Priority 2: Check recovery availability (only if not close to Smart path)
-    recovery_availability = False
-    if not close_to_smart:
-        recovery_availability = smart_helper._check_latest_wpnts(state_machine.recovery_wpnts, state_machine.cur_recovery_wpnts)
-        if (recovery_availability and smart_helper._check_free_frenet(state_machine.cur_recovery_wpnts)):
-            return StateType.RECOVERY, StateType.RECOVERY
-
-    # Priority 3: Overtaking check (use smart_helper for Fixed Frenet based checks)
-    # ===== HJ MODIFIED: Disable dynamic overtaking in Smart mode =====
-    # In Smart mode: only static overtaking allowed (dynamic overtaking disabled)
-    if static_ot_mode:
-        return StateType.OVERTAKE, StateType.OVERTAKE
-    # Note: ot_mode (dynamic overtaking) is intentionally disabled in Smart mode
-    # ===== HJ MODIFIED END =====
-
-    # Priority 4: TRAILING state - Smart mode always uses Smart path
-    if wpnts_valid and close_to_smart:
-        # rospy.logwarn(f"[Obstacle_Smart→TRAILING+SMART] Valid & close")
-        return StateType.TRAILING, StateType.SMART_STATIC
-    elif wpnts_valid:
-        # Smart path valid but not close - STILL use Smart (don't fallback!)
-        # rospy.logwarn(f"[Obstacle_Smart→TRAILING+SMART] Valid (not close) - staying in Smart")
-        return StateType.TRAILING, StateType.SMART_STATIC
-    elif recovery_availability:
-        # rospy.logwarn(f"[Obstacle_Smart→TRAILING+RECOVERY] Smart invalid, using recovery")
-        return StateType.TRAILING, StateType.RECOVERY
-    else:
-        # Last resort - Smart invalid, no recovery, still stay in Smart mode
-        # rospy.logwarn(f"[Obstacle_Smart→TRAILING+SMART] Fallback to Smart (no alternatives)")
-        return StateType.TRAILING, StateType.SMART_STATIC
+    """Smart 모드 thin wrapper — 통합 ObstacleTransition 호출."""
+    return ObstacleTransition(state_machine, _make_smart_context(state_machine), close_to_smart)
 
 
 ##################################################################################################################
 # ===== GB MODE CLOSED LOOP - Only considers GB raceline =====
 
 def NonObstacleTransition_GBMode(state_machine: StateMachine, close_to_gb: bool) -> Tuple[StateType, StateType]:
-    """Handle no obstacles case in GB tracking mode
-
-    CLOSED LOOP: Only considers GB raceline.
-    Smart Static path is completely ignored.
-
-    Args:
-        close_to_gb: True if close to GB raceline
-    """
-    # rospy.logwarn(f">>> NonObstacleTransition_GBMode: close_to_gb={close_to_gb}")
-
-    # Priority 1: Close to GB raceline - use it
-    if close_to_gb:
-        # rospy.logwarn(f"[NonObstacle_GB→GB_TRACK] ✓ Close to GB")
-        return StateType.GB_TRACK, StateType.GB_TRACK
-
-    # Priority 2: Not close to GB - use recovery to get back
-    if state_machine._check_latest_wpnts(state_machine.recovery_wpnts, state_machine.cur_recovery_wpnts):
-        if state_machine._check_on_spline(state_machine.cur_recovery_wpnts):
-            # rospy.logwarn(f"[NonObstacle_GB→RECOVERY] Not close, recovering")
-            return StateType.RECOVERY, StateType.RECOVERY
-
-    # Priority 3: No valid path - lost line
-    # rospy.logwarn(f"[NonObstacle_GB→LOSTLINE] Lost line")
-    return StateType.LOSTLINE, StateType.GB_TRACK
+    """GB 모드 thin wrapper — 통합 NonObstacleTransition 호출."""
+    return NonObstacleTransition(state_machine, _make_gb_context(state_machine), close_to_gb)
 
 
 def ObstacleTransition_GBMode(state_machine: StateMachine, close_to_gb: bool) -> Tuple[StateType, StateType]:
-    """Handle obstacles present case in GB tracking mode
-
-    CLOSED LOOP: Only considers GB raceline and GB path.
-    Smart Static path is completely ignored.
-
-    Args:
-        close_to_gb: True if close to GB raceline
-    """
-    # rospy.logwarn(f">>> ObstacleTransition_GBMode: close_to_gb={close_to_gb}, num_obs={len(state_machine.cur_obstacles_in_interest)}")
-
-    gb_path_free = state_machine._check_free_frenet(state_machine.cur_gb_wpnts)
-
-    # rospy.logwarn(f"[Obstacle_GB] close_to_gb={close_to_gb}, gb_path_free={gb_path_free}")
-
-    # Priority 1: GB path close and free - use it
-    if close_to_gb and gb_path_free:
-        # rospy.logwarn(f"[Obstacle_GB→GB_TRACK] ✓ Close & free")
-        return StateType.GB_TRACK, StateType.GB_TRACK
-
-    # Check recovery availability (only if not close to GB)
-    recovery_availability = False
-    if not close_to_gb:
-        recovery_availability = state_machine._check_latest_wpnts(state_machine.recovery_wpnts, state_machine.cur_recovery_wpnts)
-        if (recovery_availability and state_machine._check_free_frenet(state_machine.cur_recovery_wpnts)):
-            # rospy.logwarn(f"[Obstacle_GB→RECOVERY] Not close, recovery available")
-            return StateType.RECOVERY, StateType.RECOVERY
-
-    # Priority 2: Overtaking check
-    # ===== HJ MODIFIED: Disable dynamic overtaking when smart_static_active=true =====
-    # GB mode is called even when smart_static_active=true (during flag transitions)
-    # So we need to check the flag here too
-    if state_machine._check_static_overtaking_mode():
-        # rospy.logwarn(f"[Obstacle_GB→OVERTAKE] Static overtaking triggered")
-        return StateType.OVERTAKE, StateType.OVERTAKE
-    # Dynamic overtaking only when smart_static is NOT active
-    if state_machine._check_overtaking_mode() and not state_machine.smart_static_active:
-        # rospy.logwarn(f"[Obstacle_GB→OVERTAKE] Dynamic overtaking triggered")
-        return StateType.OVERTAKE, StateType.OVERTAKE
-    # ===== HJ MODIFIED END =====
-
-    # Priority 3: TRAILING state - GB mode logic
-    if close_to_gb:
-        # rospy.logwarn(f"[Obstacle_GB→TRAILING+GB] Close to GB")
-        return StateType.TRAILING, StateType.GB_TRACK
-    elif recovery_availability:
-        # rospy.logwarn(f"[Obstacle_GB→TRAILING+RECOVERY] Not close, using recovery")
-        return StateType.TRAILING, StateType.RECOVERY
-    elif gb_path_free:
-        # rospy.logwarn(f"[Obstacle_GB→TRAILING+GB] GB path free")
-        return StateType.TRAILING, StateType.GB_TRACK
-    else:
-        # Default fallback
-        # rospy.logwarn(f"[Obstacle_GB→TRAILING+GB] Fallback to GB")
-        return StateType.TRAILING, StateType.GB_TRACK
+    """GB 모드 thin wrapper — 통합 ObstacleTransition 호출."""
+    return ObstacleTransition(state_machine, _make_gb_context(state_machine), close_to_gb)
