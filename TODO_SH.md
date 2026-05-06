@@ -62,6 +62,58 @@ def NonObstacleTransition_GBMode(sm, close_to_gb):
 
 ---
 
+## Phase 17 — 통합 검증 script (2026-05-06)
+
+### 결정 사항
+- 검증 launch 파일 시도 (`3d_state_machine_validation.launch`) — **실패**.
+  ROS launch 가 노드 간 sequencing 보장 안 함: state_machine 이 global_republisher
+  의 `/global_republisher/track_length` rosparam 을 너무 일찍 읽어 `KeyError`.
+- 대신 **shell script** (`stack_master/scripts/validate_state_machine.sh`) 로 sequencing.
+  roscore → fake_odom → base_system (15s 대기) → headtohead (10s 대기) → (선택) obstacle.
+
+### 사용
+```bash
+docker exec icra2026_sh bash -c '
+  source /opt/ros/noetic/setup.bash && source ~/catkin_ws/devel/setup.bash && \
+  ~/catkin_ws/src/race_stack/stack_master/scripts/validate_state_machine.sh --obstacle'
+```
+- `--obstacle` : TRAILING/OVERTAKE 전이 시나리오 자동 주입
+- `--map gazebo_wall_2` : 다른 맵
+- `--kill` : 모든 ROS 프로세스 정리
+
+---
+
+## Phase 18 — B-3: SmartStaticChecker `__dict__` 시한폭탄 제거 (2026-05-06)
+
+### 결정 사항
+- 옛 패턴: `self.__dict__.update(parent_state_machine.__dict__)` 로 init 시 모든
+  attribute shallow copy. parent 에 attribute 가 추가/변경되면 helper 가 못 봄 (시한폭탄).
+- 추가로 17 개 `@property` 가 일부 attribute 를 parent 에서 가져오는 중복 패턴.
+- **새 패턴**: `__getattr__` 으로 self 에 없는 attribute 모두 parent 자동 fallback.
+  17 property + `__dict__.update` 모두 한 메서드로 대체.
+- Override 가 정말 필요한 것 (Fixed Frenet `cur_s/d/vs/vd`, Fixed obstacles, Smart base wpnts)
+  만 self 에 명시적으로 set.
+
+### 결과
+| | Before | After |
+|---|---|---|
+| state_helper_for_smart.py 줄 수 | 298 | **143** (52% 감소) |
+| `@property` 정의 수 | 17 | 0 (`__getattr__` 으로 통일) |
+| `__dict__.update(parent.__dict__)` 시한폭탄 | 있음 | **제거** |
+| Override 명시 attribute 수 | (전부 복사 + 일부 override) | 11 (Fixed Frenet 전용) |
+
+### 무한재귀 방어
+- `__init__` 에서 `self.__dict__['parent'] = ...` 로 parent 를 직접 set (setattr 우회)
+- `__getattr__` 에서 `object.__getattribute__(self, 'parent')` 로 parent 접근
+- `name == 'parent'` 가드로 비정상 접근 방어
+
+### 검증
+- pytest 67/67 통과
+- pyflakes 깨끗
+- Docker 통합 script 로 ROS 환경 회귀 — `GB_TRACK → TRAILING` 정상 동작
+
+---
+
 ## ✅ 검증 결과 (2026-05-06)
 
 | 항목 | 결과 |
