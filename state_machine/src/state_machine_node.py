@@ -1183,49 +1183,22 @@ class StateMachine:
         obstacles = self.cur_obstacles_in_interest
         if wpnts_data.is_init:
             for obs in obstacles:
-                # if obs.is_static:
-                if True:
-                    obs_s = obs.s_center
-                    # Wrapping madness to check if infront
-                    gap = (obs_s - self.cur_s) % self.max_s
+                obs_s = obs.s_center
+                # 자차 기준 wrap-around gap
+                gap = (obs_s - self.cur_s) % self.max_s
 
-                    if gap < max_horizon or min_horizon < (gap - self.max_s):
-                        dists = np.linalg.norm(wpnts_data.array[:,0:2] - np.array([obs.x_m, obs.y_m]), axis=1)
-                        min_dist = np.min(dists)
-                        
-                        free_dist = min_dist - obs.size/2 - self.gb_ego_width_m /2
-                        
-                        scaling_factor = np.clip(gap / free_scaling_reference_distance_m, 0.0, 1.0)
+                if gap < max_horizon or min_horizon < (gap - self.max_s):
+                    dists = np.linalg.norm(wpnts_data.array[:, 0:2] - np.array([obs.x_m, obs.y_m]), axis=1)
+                    min_dist = np.min(dists)
+                    free_dist = min_dist - obs.size / 2 - self.gb_ego_width_m / 2
+                    scaling_factor = np.clip(gap / free_scaling_reference_distance_m, 0.0, 1.0)
 
-                        # rospy.logwarn(scaling_factor)
-                        if free_dist < lateral_width_m * scaling_factor:
-                            is_free = False
-                            if closest_obs is None or min_gap > gap:
-                                closest_obs = obs
-                                min_gap = gap
-                            rospy.loginfo(f"[{self.name}] RECOVERY_FREE False, obs dist to recovery lane: {min_dist} m")
-                else:
-                    pass
-                    # obs_s = obs.s_center
-                    # # Wrapping madness to check if infront
-                    # gap = (obs_s - self.cur_s) % self.max_s
-                    # if gap < horizon:
-                    #     obs_d = obs.d_center
-                    #     # Get d wrt to mincurv from the overtaking line
-                    #     avoid_wpnt_idx = np.argmin(
-                    #         np.array([abs(avoid_s.s_m - obs_s) for avoid_s in self.last_valid_avoidance_wpnts.wpnts])
-                    #     )
-                    #     ot_d = self.last_valid_avoidance_wpnts.wpnts[avoid_wpnt_idx].d_m
-                    #     ot_obs_dist = ot_d - obs_d
-                    #     # if abs(ot_obs_dist) - obs.size/2 < self.lateral_width_ot_m:
-                    #     if True:
-                    #         is_free = False
-                    #         rospy.loginfo("[State Machine] O_FREE False, obs dist to ot lane: {} m".format(ot_obs_dist))
-                    #         if closest_obs is None or min_gap > gap:
-                    #             closest_obs = obs
-                    #             min_gap = gap
-                    
-                    
+                    if free_dist < lateral_width_m * scaling_factor:
+                        is_free = False
+                        if closest_obs is None or min_gap > gap:
+                            closest_obs = obs
+                            min_gap = gap
+                        rospy.loginfo(f"[{self.name}] RECOVERY_FREE False, obs dist to recovery lane: {min_dist} m")
         else:
             is_free = True
         wpnts_data.closest_target = closest_obs
@@ -1341,22 +1314,19 @@ class StateMachine:
             return False
 
     def _check_overtaking_mode_sustainability(self) -> bool:
+        """현재 OT 모드(static/dynamic)의 경로가 여전히 사용 가능한지 판정."""
         if self.static_overtaking_mode:
-            if (
-                self._check_availability(self.static_avoidance_wpnts, self.cur_static_avoidance_wpnts)
-                and self._check_free_frenet(self.cur_static_avoidance_wpnts)
-            ):
-                return True
+            wpnts_msg = self.static_avoidance_wpnts
+            wpnts_data = self.cur_static_avoidance_wpnts
         else:
-            # if self._check_ot_sector():
-            if True:
-                if self._check_availability(self.avoidance_wpnts, self.cur_avoidance_wpnts):
-                    rospy.logwarn("AVAILABLE")
-                    if self._check_free_frenet(self.cur_avoidance_wpnts):
-                        # rospy.logwarn("OFREE")
-                        return True
+            wpnts_msg = self.avoidance_wpnts
+            wpnts_data = self.cur_avoidance_wpnts
 
-        return False
+        if not self._check_availability(wpnts_msg, wpnts_data):
+            return False
+        if not self.static_overtaking_mode:
+            rospy.logwarn("AVAILABLE")  # 원본의 dynamic 분기 로그 보존
+        return self._check_free_frenet(wpnts_data)
 
     # def _check_on_merger(self) -> bool:
     #     if self.merger is not None:

@@ -1,38 +1,49 @@
 #!/usr/bin/env python3
-import threading
 import time
-import copy
-import numpy as np
-import os
-import json
-from typing import Tuple, List  # ===== HJ ADDED =====
+from typing import Tuple, List
 
+import numpy as np
 import rospy
-from rospkg import RosPack
-import tf
+import trajectory_planning_helpers as tph
 from dynamic_reconfigure.msg import Config
-from f110_msgs.msg import ObstacleArray, OTWpntArray, WpntArray, Wpnt, BehaviorStrategy, Obstacle, Prediction, PredictionArray
-from geometry_msgs.msg import PoseStamped
-from nav_msgs.msg import Odometry
+from f110_msgs.msg import WpntArray, Wpnt
 from scipy.interpolate import InterpolatedUnivariateSpline as Spline
-from std_msgs.msg import String, Float32, Float32MultiArray, Bool
-from visualization_msgs.msg import Marker, MarkerArray
 # 3D: use 2.5D velocity planner with slope/track_3d_params/grip_scale_exp
 from vel_planner_25d.vel_planner import calc_vel_profile
 
-import trajectory_planning_helpers as tph
-import configparser
+# Pure-function path checker (단계적으로 분리 중인 collision check 로직)
+from path_checker import (
+    EgoFrenetState,
+    FrenetCheckParams,
+    GettingCloserParams,
+    OnSplineParams,
+    OvertakingModeChecks,
+    StaticOvertakingChecks,
+    TrajFreshnessParams,
+    check_free_frenet,
+    is_getting_closer,
+    is_in_overtaking_zone,
+    is_on_spline,
+    is_traj_msg_fresh,
+    should_engage_overtaking,
+    should_engage_static_overtaking,
+)
+
+# Visualization / init / callback 메서드 묶음 (mixin)
+from state_machine_visualization import VisualizationMixin
+from state_machine_init import InitMixin
+from state_machine_callbacks import (
+    CallbackMixin,
+    ENABLE_STATIC_SECTOR_FILTERING,
+    HORIZON_FOR_TTL,
+)
 
 # ===== HJ ADDED: Debug logging helper for state_machine_node =====
 DEBUG_LOGGING_ENABLED = False  # Set to False to disable all debug logging
 _debug_log_cache = {}
 
-# ===== HJ ADDED: Global flag for static sector obstacle filtering =====
-# Set to True to enable stricter filtering for static obstacles in static sectors
-# Set to False to use original behavior (same as before TTL increase)
-
-ENABLE_STATIC_SECTOR_FILTERING = False
-HORIZON_FOR_TTL = 3.0
+# NOTE: ENABLE_STATIC_SECTOR_FILTERING / HORIZON_FOR_TTL 은 state_machine_callbacks 로 이동.
+# 메인은 callback 모듈에서 import 한다 (위 import 블록 참조).
 
 MAX_VEL_RIGHT_BEFORE_STATIC_OT = 5.0
 
@@ -40,86 +51,31 @@ MAX_VEL_RIGHT_BEFORE_STATIC_OT = 5.0
 DEBUG_STATE_TRANSITION = False  # Set to True to see state transition warnings
 # ===== HJ ADDED END =====
 
+
+# NOTE: STATE_COLORS / _STATE_COLOR_DEFAULT 는 state_machine_visualization 으로 이동.
+
 def debug_log_on_change(tag, **kwargs):
-    """Log only when any of the kwargs values change
+    """이전 호출과 kwargs 값이 다를 때만 로그.
 
-    Can be globally enabled/disabled via DEBUG_LOGGING_ENABLED flag.
-
-    Usage:
-        debug_log_on_change("MyTag", value1=x, value2=y, value3=z)
+    DEBUG_LOGGING_ENABLED 가 False 면 no-op. 캐시는 모듈 전역 dict (`_debug_log_cache`).
+    item 할당만 하므로 `global` 선언 필요 없음.
     """
-    global _debug_log_cache
-
-    # Skip if debug logging is disabled
     if not DEBUG_LOGGING_ENABLED:
         return
 
-    # Create cache key
     cache_key = tag
-
-    # Get previous values
     prev_values = _debug_log_cache.get(cache_key, None)
-
-    # Check if any value changed
     if prev_values != kwargs:
-        # Build log message
         msg_parts = [f"{k}={v}" for k, v in kwargs.items()]
         rospy.logwarn(f"[DEBUG {tag}] " + ", ".join(msg_parts))
-
-        # Update cache
         _debug_log_cache[cache_key] = kwargs.copy()
-# ===== HJ ADDED END =====
 
 
-try:
-    # if we are in the car, vesc msgs are built and we read them
-    from vesc_msgs.msg import VescStateStamped
-except:
-    pass
-
-import state_transitions
-import states
 from states_types import StateType
+from waypoint_data import WaypointData
 
-class WaypointData:
-    def __init__(self, planner_name, is_closed):
-        self.name =planner_name
-        self.node_name = "/dyn_planners_statemachine/" + self.name
-        self.list = []
-        self.array = None
-        self.stamp = None
-        self.is_init = False
-        self.is_gb_track_wpnts = False
-        self.is_ot_wpnts = False
-        self.closest_target = None
-        self.closest_gap = None
-        self.is_closed = is_closed
-        self.vel_planner_safety_factor = 1.0
-        self.dyn_sub = rospy.Subscriber(self.node_name + "/parameter_updates", Config, self.dyn_param_cb)
-        self.update_param()
 
-    def dyn_param_cb(self, config):
-        self.update_param()
-
-    def update_param(self):
-        self.min_horizon = rospy.get_param(self.node_name + "/min_horizon")
-        self.max_horizon = rospy.get_param(self.node_name + "/max_horizon")
-        self.lateral_width_m = rospy.get_param(self.node_name + "/lateral_width_m")
-        self.free_scaling_reference_distance_m = rospy.get_param(self.node_name + "/free_scaling_reference_distance_m")
-        self.latest_threshold = rospy.get_param(self.node_name + "/latest_threshold")
-        self.on_spline_front_horizon_thres_m = rospy.get_param(self.node_name + "/on_spline_front_horizon_thres_m")
-        self.on_spline_min_dist_thres_m = rospy.get_param(self.node_name + "/on_spline_min_dist_thres_m")
-        self.hyst_timer_sec = rospy.get_param(self.node_name + "/hyst_timer_sec")
-        self.killing_timer_sec = rospy.get_param(self.node_name + "/killing_timer_sec")
-            
-    def initialize_traj(self, wpnt):
-        if len(wpnt.wpnts) != 0:
-            self.stamp = wpnt.header.stamp
-            self.list = wpnt.wpnts
-            self.array = np.array([[wpnt.x_m, wpnt.y_m, wpnt.s_m, wpnt.d_m] for wpnt in wpnt.wpnts])
-            self.is_init = True
-
-class StateMachine:
+class StateMachine(InitMixin, VisualizationMixin, CallbackMixin):
     """
     This state machine ideally should subscribe to topics and calculate flags/conditions.
     State transistions and state behaviors are described in `state_transistions.py` and `states.py`
@@ -127,644 +83,78 @@ class StateMachine:
 
     def __init__(self, name) -> None:
         self.name = name
-        self.rate_hz = rospy.get_param("state_machine/rate")  # rate of planner in hertz
-        self.n_loc_wpnts = rospy.get_param("state_machine/n_loc_wpnts")  # number of local waypoints published
-        self.local_wpnts = WpntArray()
-        self.waypoints_dist = 0.1  # [m]
-        
-        self.lock = threading.Lock()  # lock for concurrency on waypoints
-        self.measuring = rospy.get_param("/measure", default=False)
 
-        # get initial dynamic parameters
-        self.racecar_version = rospy.get_param("/racecar_version")
-        self.sectors_params = rospy.get_param("/map_params")
-        self.timetrials_only = rospy.get_param("state_machine/timetrials_only", False)
-        self.n_sectors = self.sectors_params["n_sectors"]
-        # only ftg zones
-        self.only_ftg_zones = []
-        self.ftg_counter = 0
-        
-        self.cur_s = 0.0
-        self.cur_d = 0.0
-        self.cur_vs = 0.0
-        
-        # Velocity Planning
-        parser = configparser.ConfigParser()
-        self.pars = {}
-        if not parser.read(os.path.join(RosPack().get_path('stack_master'), 'config', self.racecar_version, 'racecar_f110.ini')):
-            raise ValueError('Specified config file does not exist or is empty!')
-        self.pars["veh_params"] = json.loads(parser.get('GENERAL_OPTIONS', 'veh_params'))
-        self.pars["vel_calc_opts"] = json.loads(parser.get('GENERAL_OPTIONS', 'vel_calc_opts'))
-        ggv_path = os.path.join(RosPack().get_path('stack_master'), 'config', self.racecar_version, "veh_dyn_info", "ggv.csv")
-        ax_max_path = os.path.join(RosPack().get_path('stack_master'), 'config', self.racecar_version, "veh_dyn_info", "ax_max_machines.csv")
-        b_ax_max_path = os.path.join(RosPack().get_path('stack_master'), 'config', self.racecar_version, "veh_dyn_info", "b_ax_max_machines.csv")
-        self.ggv, self.ax_max_machines = tph.import_veh_dyn_info.\
-            import_veh_dyn_info(ggv_import_path=ggv_path,
-                                ax_max_machines_import_path=ax_max_path)
-            
-        _, self.b_ax_max_machines = tph.import_veh_dyn_info.\
-            import_veh_dyn_info(ggv_import_path=ggv_path,
-                                ax_max_machines_import_path=b_ax_max_path)
+        self._load_rosparams()
+        self._load_vehicle_dynamics()
+        self._load_vel_planner_params()
+        self._init_state_attributes()
 
-        # 3D: vel planner parameters
-        # (1) Init from vel_planner.yaml (same source as global_velocity_planner_3d)
-        # (2) Subscribe to /global_velplanner_3d/parameter_updates for rqt real-time sync
-        import yaml as _yaml
-        self._h_cog = self.pars["veh_params"].get("cog_z", 0.074)
-        self._slope_correction = 1.0
-        self._slope_brake_margin = 0.0
-        self._slope_brake_vmax = 5.0
-        self._grip_scale_exp = 0.7
+        self._setup_ros_subscribers()
+        self._setup_ros_publishers()
 
-        _vel_yaml_path = os.path.join(
-            RosPack().get_path('stack_master'), 'config', self.racecar_version, 'vel_planner.yaml')
-        try:
-            with open(_vel_yaml_path) as _f:
-                _vp = _yaml.safe_load(_f)
-            self._apply_vel_planner_params(_vp)
-            rospy.loginfo(f"[StateMachine3D] vel_planner.yaml loaded")
-        except Exception as _e:
-            rospy.logwarn(f"[StateMachine3D] vel_planner.yaml not found ({_e}), using defaults")
-
-        # Subscribe to rqt dynamic_reconfigure from global_velplanner_3d node
-        rospy.Subscriber("/global_velplanner_3d/parameter_updates", Config,
-                         self._vel_planner_3d_param_cb)
-
-        # overtaking variables
-        self.ot_sectors_params = rospy.get_param("/ot_map_params")
-        self.n_ot_sectors = self.ot_sectors_params["n_sectors"]
-        self.overtake_wpnts = None
-        self.overtake_zones = []
-        self.ot_begin_margin = 0.5
-        self.cur_volt = 11.69  # default value for sim
-        self.volt_threshold = rospy.get_param("state_machine/volt_threshold", default=10)
-        self.static_overtaking_mode = False
-        # Planner parameters
-        self.ot_planner = rospy.get_param("state_machine/ot_planner", default="predictive_spliner")
-
-        # waypoint variables
-        self.cur_id_ot = 1
-        self.max_speed = -1  # max speed in global waypoints for visualising
-        self.max_s = 0
-        self.current_position = None
-        self.gb_wpnts = None
-        self.recovery_wpnts = None
-        self.smart_static_wpnts = None  # ===== HJ ADDED: Smart static avoidance waypoints from spliner =====
-        self.smart_static_active = False  # ===== HJ ADDED: Flag from spliner - is smart static mode active? =====
-        self.gb_max_idx = None
-        self.wpnt_dist = self.waypoints_dist
-        self.num_glb_wpnts = 0  # number of waypoints on global trajectory
-        self.num_ot_points = 0
-        self.previous_index = 0
-        self.gb_ego_width_m = rospy.get_param("state_machine/gb_ego_width_m")
-        self.lateral_width_gb_m = rospy.get_param("state_machine/lateral_width_gb_m", 0.3)  # [m] DYNIAMIC PARAMETER
-        self.gb_horizon_m = rospy.get_param("state_machine/gb_horizon_m")
-        self.interest_horizon_m = rospy.get_param("state_machine/interest_horizon_m", 20.0)
-        
-
-        # self.cur_overtaking_wpts = None
-
-        self.last_recovery_update_time =None
-        # self.cur_recovery_wpnts = WpntArray()
-        self.cur_gb_wpnts = WaypointData('global_tracking', True)
-        self.cur_recovery_wpnts = WaypointData('recovery_planner', False)
-        self.cur_avoidance_wpnts = WaypointData('dynamic_avoidance_planner', False)
-        self.cur_static_avoidance_wpnts = WaypointData('static_avoidance_planner', False)
-        self.cur_start_wpnts = WaypointData('start_planner', False)
-        # ===== HJ MODIFIED: Use static_avoidance_planner params for smart_static =====
-        self.cur_smart_static_avoidance_wpnts = WaypointData('static_avoidance_planner', True)
-        self.smart_track_length = None  # Track length from Smart Static path (from s_m)
-        self.smart_wpnt_dist = None  # Average waypoint distance from Smart Static path (from s_m)
-        # ===== HJ MODIFIED END =====
-
-
-        self.cur_avoidance_wpnts.is_ot_wpnts = True
-        self.cur_static_avoidance_wpnts.is_ot_wpnts = True
-        self.cur_gb_wpnts.is_gb_track_wpnts = True
-        self.cur_recovery_wpnts.vel_planner_safety_factor = 0.5
-        # self.cur_recovery_wpnts = WpntArray()
-        # self.cur_recovery_array = np.zeros((5, 2))
-
-        # self.gb_horizon_m = 0.7
-
-
-        self.gb_closest_target = None
-        self.gb_closest_gap = None
-        self.recovery_closest_target = None
-        self.recovery_closest_gap = None
-        self.ot_closest_target = None
-        self.ot_closest_gap = None
-
-        self.behavior_strategy = BehaviorStrategy()
-        # mincurv spline
-        self.mincurv_spline_x = None
-        self.mincurv_spline_y = None
-        # ot spline
-        self.ot_spline_x = None
-        self.ot_spline_y = None
-        self.ot_spline_d = None
-        self.recompute_ot_spline = True
-
-        # obstacle avoidance variables
-        self.obstacles = []
-        self.obstacles_in_interest = []
-        self.cur_obstacles_in_interest = []
-        self.obstacles_perception = []
-        self.obstacles_prediction_id = None
-        self.obstacles_prediction = []
-        self.ego_prediction = []
-        self.obstacle_was_here = True
-        self.side_by_side_threshold = 0.6
-        self.merger = None
-        self.force_trailing = False
-        self.use_force_trailing = not rospy.get_param("state_machine/use_force_trailing", False)
-
-        # spliner variables
-        self.splini_ttl = rospy.get_param("state_machine/splini_ttl", 2.0) if self.ot_planner == "spliner" else rospy.get_param("state_machine/pred_splini_ttl", 0.2)
-        self.splini_ttl_counter = int(self.splini_ttl * self.rate_hz)  # convert seconds to counters
-        self.avoidance_wpnts = None
-        self.static_avoidance_wpnts = None
-        self.start_wpnts = None
-        self.start_wpnts_array = None
-        self.last_valid_avoidance_wpnts = None
-        self.last_valid_avoidance_array = None
-        self.last_valid_static_avoidance_wpnts = None
-        
-        self.overtaking_horizon_m = rospy.get_param("state_machine/overtaking_horizon_m", 6.9)
-        self.lateral_width_ot_m = rospy.get_param("state_machine/lateral_width_ot_m", 0.3)  # [m] DYNIAMIC PARAMETER
-        self.splini_hyst_timer_sec = rospy.get_param("state_machine/splini_hyst_timer_sec", 0.75)
-        self.emergency_break_horizon = rospy.get_param("state_machine/emergency_break_horizon", 1.1)
-        self.emergency_break_d = 0.12  # [m]
-        
-        # Graph Based Variables
-        self.graph_based_wpts = None
-        self.gb_wpnts_arr = None
-        #Frenet Variables
-        self.frenet_wpnts = WpntArray()
-        # Parameters
-        self.track_length = rospy.get_param("/global_republisher/track_length")
-        # FTG params
-        self.ftg_speed_mps = rospy.get_param("state_machine/ftg_speed_mps", 1.0) # [mps] DYNIAMIC PARAMETER
-        self.ftg_timer_sec = rospy.get_param("state_machine/ftg_timer_sec", 3.0) # [s] DYNIAMIC PARAMETER
-        self.ftg_disabled = not rospy.get_param("state_machine/ftg_active", False)
-
-        # Force GBTRACK state
-        self.force_gbtrack_state = rospy.get_param("state_machine/force_GBTRACK", False) 
-
-        self.overtaking_ttl_sec = rospy.get_param("state_machine/overtaking_ttl_sec", 3.0)
-        self.overtaking_ttl_count = 0
-        self.overtaking_ttl_count_threshold = int(self.overtaking_ttl_sec * self.rate_hz)
-
-        self.save_start_traj = False
-        self.cur_start_wpnts_candidate = OTWpntArray()
-        self.need_start_traj = False
-        # visualization variables
-        self.first_visualization = True
-        self.x_viz = 0
-        self.y_viz = 0
-
-        # STATES
-        self.cur_state = StateType.GB_TRACK
-        self.local_wpnts_src = StateType.GB_TRACK
-        self.static_avoid = False
-
-        self.fail_trailing = False
-
-        self.states = {  # this is very manual, but should not be a problem as in general states should not be too many
-            StateType.GB_TRACK: states.GlobalTracking,
-            # StateType.TRAILING: states.Trailing,
-            # StateType.ATTACK: states.Trailing,
-            StateType.OVERTAKE: states.Overtaking,
-            StateType.FTGONLY: states.FTGOnly,
-            StateType.RECOVERY: states.RECOVERY,
-            StateType.START: states.START,
-            StateType.SMART_STATIC: states.SmartStatic,  # ===== HJ ADDED =====
-        }
-        self.state_transitions = (
-            {  # this is very manual, but should not be a problem as in general states should not be too many
-                StateType.GB_TRACK: state_transitions.GlobalTrackingTransition,
-                StateType.RECOVERY: state_transitions.RecoveryTransition,
-                StateType.TRAILING: state_transitions.TrailingTransition,
-                StateType.ATTACK: state_transitions.TrailingTransition,
-                StateType.OVERTAKE: state_transitions.OvertakingTransition,
-                StateType.FTGONLY: state_transitions.FTGOnlyTransition,
-                StateType.START: state_transitions.StartTransition,
-                StateType.SMART_STATIC: state_transitions.SmartStaticTransition,  # ===== HJ ADDED =====
-            }
-
-        )
-
-        # SUBSCRIPTIONS
-        self.opponent = ObstacleArray()
-        
-        # self.opponent_pub = rospy.Publisher("/opponent", ObstacleArray, queue_size=1)
-
-        rospy.Subscriber("/car_state/odom", Odometry, self.odom_cb)
-        rospy.wait_for_message("/car_state/odom", Odometry)
-        rospy.Subscriber("/global_waypoints_scaled", WpntArray, self.glb_wpnts_cb)  # from velocity scaler
-        rospy.Subscriber("/planner/recovery/wpnts", WpntArray, self.recovery_wpnts_cb)  # from velocity scaler
-        rospy.Subscriber("/global_waypoints/overtaking", WpntArray, self.overtake_cb)
-        # wait for global trajectory
-        rospy.wait_for_message("/global_waypoints_scaled", WpntArray)
-        rospy.wait_for_message("/global_waypoints/overtaking", WpntArray)
-        rospy.Subscriber("/car_state/odom_frenet", Odometry, self.frenet_pose_cb)
-        rospy.wait_for_message("/car_state/odom_frenet", Odometry)
-        rospy.Subscriber("/global_waypoints", WpntArray, self.glb_wpnts_og_cb)  # from og wpnts
-        
-        # dynamic parameters subscriber
-        rospy.Subscriber("/dyn_statemachine/parameter_updates", Config, self.dyn_param_cb)
-        rospy.Subscriber("/dyn_sector_tuner/speed/parameter_updates", Config, self.sector_dyn_param_cb)
-        rospy.Subscriber("/dyn_sector_tuner/overtake/parameter_updates", Config, self.ot_dyn_param_cb)
-        rospy.Subscriber("/tracking/obstacles", ObstacleArray, self.obstacle_perception_cb)
-        rospy.Subscriber("/opponent_prediction/obstacles_pred", PredictionArray, self.obstacle_prediction_cb)
-        rospy.Subscriber("/mpc_controller/ego_prediction", PredictionArray, self.ego_prediction_cb)
-        if self.ot_planner == "spliner" or self.ot_planner == "predictive_spliner":
-            rospy.Subscriber("/planner/avoidance/otwpnts", OTWpntArray, self.avoidance_cb)
-            # ===== HJ ADDED: Subscribe to smart static avoidance waypoints and flag =====
-            rospy.Subscriber("/planner/avoidance/smart_static_otwpnts", OTWpntArray, self.smart_static_avoidance_cb)
-            from std_msgs.msg import Bool
-            rospy.Subscriber("/planner/avoidance/smart_static_active", Bool, self.smart_static_active_cb)
-            # ===== HJ ADDED END =====
-            if self.ot_planner == "predictive_spliner":
-                rospy.Subscriber("/planner/avoidance/static_otwpnts", OTWpntArray, self.static_avoidance_cb)
-        if self.ot_planner == "predictive_spliner":
-            rospy.Subscriber("/planner/avoidance/merger", Float32MultiArray, self.merger_cb)
-            rospy.Subscriber("collision_prediction/force_trailing", Bool, self.force_trailing_cb)
-            rospy.Subscriber("planner/avoidance/fail_trailing", Bool, self.fail_trailing_cb)
-        if not rospy.get_param("/sim"):
-            rospy.Subscriber("/vesc/sensors/core", VescStateStamped, self.vesc_state_cb) # for reading battery voltage
-            
-        rospy.Subscriber("/planner/start_wpnts", OTWpntArray, self.start_wpnts_cb)
-
-
-
-        # PUBLICATIONS 
-        self.behavior_strategy_pub = rospy.Publisher("behavior_strategy", BehaviorStrategy, queue_size=1)
-        self.trailing_marker_pub = rospy.Publisher("/state_machine/trailing_target", Marker, queue_size=10)
-        self.overtaking_marker_pub = rospy.Publisher("/state_machine/overtaking_target", Marker, queue_size=10)
-        self.obstacles_in_interest_marker_pub = rospy.Publisher("/state_machine/obstacles_in_interest", MarkerArray, queue_size=10)  # ===== HJ ADDED =====
-
-        self.loc_wpnt_pub = rospy.Publisher("local_waypoints", WpntArray, queue_size=1)
-        self.vis_loc_wpnt_pub = rospy.Publisher("local_waypoints/markers", MarkerArray, queue_size=10)
-        self.vis_loc_vel_pub = rospy.Publisher("local_waypoints/vel_markers", MarkerArray, queue_size=10)
-        self.state_pub = rospy.Publisher("state_machine", String, queue_size=1)
-        self.state_mrk = rospy.Publisher("/state_marker", Marker, queue_size=10)
-        self.state_wpnts_src_marker = rospy.Publisher("/state_wpnts_src_marker", Marker, queue_size=10)  # ===== HJ ADDED =====
-        self.emergency_pub = rospy.Publisher("/emergency_marker", Marker, queue_size=5) # for low voltage
-        self.ot_section_check_pub = rospy.Publisher("/ot_section_check", Bool, queue_size=1)
-        if self.measuring:
-            self.latency_pub = rospy.Publisher("/state_machine/latency", Float32, queue_size=10)
-
-        rospy.Subscriber("/save_start_traj", Bool, self.save_start_traj_cb)
-
-        # ===== HJ ADDED: Initialize Smart Static helper for Fixed Frenet transitions =====
+        # Smart Static helper는 모든 publisher / state attribute 가 만들어진 뒤 생성
+        # (parent의 __dict__ 를 복사하므로 의존성 큼)
         from state_helper_for_smart import SmartStaticChecker
         self.smart_helper = SmartStaticChecker(self)
         rospy.loginfo(f"[{self.name}] Smart Static helper initialized for Fixed Frenet transitions")
-        # ===== HJ ADDED END =====
 
-        # MAIN LOOP
+        # MAIN LOOP — 무한 루프 진입
         self.loop()
+
+    # =========================================================================
+    # Properties — Smart helper / GB 좌표계 분기를 한 곳에 모아 패턴 반복 제거.
+    # SmartStaticChecker 는 부모(StateMachine)에 self.parent 를 추가로 가지므로
+    # `is_smart_helper` 가 두 클래스에서 다른 값을 반환한다.
+    # =========================================================================
+
+    @property
+    def is_smart_helper(self) -> bool:
+        """SmartStaticChecker 인스턴스인지 (parent attribute 보유 여부)."""
+        return hasattr(self, 'parent')
+
+    @property
+    def role_tag(self) -> str:
+        """디버그 로그용 'HELPER'(SmartStaticChecker) / 'PARENT'(StateMachine) 태그."""
+        return "HELPER" if self.is_smart_helper else "PARENT"
+
+    @property
+    def gb_cur_s(self) -> float:
+        """GB Frenet cur_s. SmartStaticChecker 일 때는 parent 의 GB cur_s 사용
+        (self.cur_s 는 Fixed Frenet 으로 override 되어 있으므로)."""
+        return self.parent.cur_s if self.is_smart_helper else self.cur_s
+
+    @property
+    def gb_waypoints_dist(self) -> float:
+        """GB raceline 의 waypoint 간격. SmartStaticChecker 일 때는 parent 의 것."""
+        return self.parent.waypoints_dist if self.is_smart_helper else self.waypoints_dist
+
+    @property
+    def active_helper(self):
+        """현재 활성 모드의 데이터 source.
+
+        Smart 모드(`smart_static_active=True`)면 `smart_helper` (Fixed Frenet 기반).
+        그 외엔 `self` (GB Frenet 기반).
+
+        주의: `smart_helper.cur_gb_wpnts.closest_target` 와 `self.gb_closest_target` 는
+        다른 attribute 라 모든 분기를 통합하지는 못한다 (cur_*_wpnts.closest_target / closest_gap
+        만 같은 인터페이스를 공유).
+        """
+        return self.smart_helper if self.smart_static_active else self
+
+    @property
+    def current_mode_tag(self) -> str:
+        """디버그 로그용 현재 모드 — 'SMART' / 'GB'."""
+        return "SMART" if self.smart_static_active else "GB"
+
+    # NOTE: __init__ 헬퍼 6개 (_load_rosparams, _load_vehicle_dynamics,
+    # _load_vel_planner_params, _init_state_attributes, _setup_ros_subscribers,
+    # _setup_ros_publishers) 는 InitMixin 으로 이동.
 
     def on_shutdown(self):
         rospy.loginfo(f"[{self.name}] Shutting down state machine")
 
-    #############
-    # CALLBACKS #
-    #############
-    def save_start_traj_cb(self, msg):
-        # self.save_start_traj = True
-        if len(self.cur_start_wpnts_candidate.wpnts) !=0:
-            # self.start_wpnts = data
-            # self.start_wpnts.header.stamp = rospy.Time.now()
-            # self.start_wpnts_array = np.array([[wpnt.x_m, wpnt.y_m] for wpnt in self.start_wpnts.wpnts])
-            self.update_velocity(self.cur_start_wpnts_candidate, self.cur_start_wpnts.vel_planner_safety_factor)
-            
-
-            self.cur_start_wpnts.initialize_traj(self.cur_start_wpnts_candidate)
-            self.cur_state = StateType.START
-            # self.save_start_traj = False
-
-
-    def vesc_state_cb(self, data):
-        """vesc state callback, reads the voltage"""
-        self.cur_volt = data.state.voltage_input
-        
-    def frenet_planner_cb(self, data: WpntArray):
-        """frenet planner waypoints"""
-        self.frenet_wpnts = data
-
-    def recovery_wpnts_cb(self, data: WpntArray):
-        if len(data.wpnts) !=0:
-            self.update_velocity(data, self.cur_recovery_wpnts.vel_planner_safety_factor)
-        # self.recovery_wpnts = data.wpnts.copy()
-        self.recovery_wpnts = data
-
-    def avoidance_cb(self, data: OTWpntArray):
-        """splini waypoints"""
-        if len(data.wpnts) !=0:
-            self.update_velocity(data, self.cur_avoidance_wpnts.vel_planner_safety_factor)
-        self.avoidance_wpnts = data
-
-    def static_avoidance_cb(self, data: OTWpntArray):
-        """static splini waypoints"""
-        if len(data.wpnts) !=0:
-            self.update_velocity(data, self.cur_static_avoidance_wpnts.vel_planner_safety_factor)
-        self.static_avoidance_wpnts = data
-
-    # ===== HJ ADDED: Smart static avoidance callbacks =====
-    def smart_static_avoidance_cb(self, data: OTWpntArray):
-        """Smart static avoidance waypoints from GB optimizer fixed path"""
-        # ===== HJ ADDED: Only update if timestamp is newer than what we already have =====
-        # This prevents Smart node's old messages from overwriting global_velocity_planner's updates
-        # When global_velocity_planner is running: publishes with current timestamp -> always newer
-        # When global_velocity_planner stops: Smart's old timestamp is ignored -> keeps last velocity_planner result
-        if (self.smart_static_wpnts is None or
-            data.header.stamp > self.smart_static_wpnts.header.stamp):
-            self.smart_static_wpnts = data
-            self.cur_smart_static_avoidance_wpnts.initialize_traj(data)
-        else:
-            # Ignore older message (timestamp <= current)
-            return
-        # ===== HJ ADDED END =====
-
-        # ===== HJ MODIFIED: Use s_m directly from OTWpntArray instead of FrenetConverter =====
-        # OTWpntArray already contains s_m values, no need to create FrenetConverter
-        if len(data.wpnts) > 0 and self.smart_track_length is None:
-            # Track length from last waypoint's s_m
-            self.smart_track_length = data.wpnts[-1].s_m
-
-            # Average waypoint distance from consecutive s_m differences
-            if len(data.wpnts) >= 2:
-                s_diffs = [data.wpnts[i].s_m - data.wpnts[i-1].s_m for i in range(1, len(data.wpnts))]
-                self.smart_wpnt_dist = np.mean(s_diffs)
-            else:
-                self.smart_wpnt_dist = self.smart_track_length
-
-            rospy.loginfo(f"[{self.name}] Smart Static path initialized: "
-                         f"track_length={self.smart_track_length:.2f}m, wpnt_dist={self.smart_wpnt_dist:.3f}m, "
-                         f"num_wpnts={len(data.wpnts)}")
-        # ===== HJ MODIFIED END =====
-
-    def smart_static_active_cb(self, data):
-        """Flag from spliner: is smart static mode currently active?"""
-        self.smart_static_active = data.data
-    # ===== HJ ADDED END =====
-
-    def start_wpnts_cb(self, data: OTWpntArray):
-        """static splini waypoints"""
-        if len(data.wpnts) !=0:
-            self.cur_start_wpnts_candidate = data
-
-        #     # self.start_wpnts = data
-        #     # self.start_wpnts.header.stamp = rospy.Time.now()
-        #     # self.start_wpnts_array = np.array([[wpnt.x_m, wpnt.y_m] for wpnt in self.start_wpnts.wpnts])
-        #     self.update_velocity(data)
-        
-        #     self.cur_start_wpnts.initialize_traj(data)
-        #     self.cur_state = StateType.START
-        #     self.save_start_traj = False
-
-    def overtake_cb(self, data):
-        """
-        Callback function of overtake subscriber.
-
-        Parameters
-        ----------
-        data
-            Data received from overtake topic
-        """
-        self.overtake_wpnts = data.wpnts
-        self.num_ot_points = len(self.overtake_wpnts)
-
-        # compute the OT spline when new spline
-        if self.recompute_ot_spline and self.num_ot_points != 0:
-            self.ot_splinification()
-            self.recompute_ot_spline = False
-
-    def glb_wpnts_cb(self, data: WpntArray):
-        """
-        Callback function of velocity interpolator subscriber.
-
-        Parameters
-        ----------
-        data
-            Data received from velocity interpolator topic
-        """
-        data.wpnts = data.wpnts[:-1] # exclude last point (because last point == first point)
-        self.gb_wpnts = data  
-        self.num_glb_wpnts = len(data.wpnts)
-
-        self.n_loc_wpnts = min(self.n_loc_wpnts, int(self.num_glb_wpnts/2))
-
-        self.max_s = data.wpnts[-1].s_m
-        # Get spacing between wpnts for rough approximations
-        self.wpnt_dist = data.wpnts[1].s_m - data.wpnts[0].s_m
-        self.waypoints_dist = self.wpnt_dist
-        self.gb_max_idx = data.wpnts[-1].id
-        if self.ot_planner == "graph_based":
-            self.gb_wpnts_arr = np.array([
-                [w.s_m, w.d_m, w.x_m, w.y_m, w.d_right, w.d_left, w.psi_rad,
-                w.kappa_radpm, w.vx_mps, w.ax_mps2] for w in data.wpnts
-            ])
-
-    def glb_wpnts_og_cb(self, data):
-        """
-        Callback function of OG global waypoints 100% speed.
-
-        Parameters
-        ----------
-        data
-            Data received from velocity interpolator topic
-        """
-        if self.max_speed == -1:
-            self.max_speed = max([wpnt.vx_mps for wpnt in data.wpnts])
-        else:
-            pass
-    
-    def graphbased_wpts_cb(self, data):
-        arr = np.asarray(data.data)
-        self.graph_based_wpts = arr.reshape(data.layout.dim[0].size, data.layout.dim[1].size)
-        self.graph_based_action = data.layout.dim[0].label
-    
-    # ===== HJ COMMENTED: Original version without static sector filtering =====
-    # def obstacle_perception_cb(self, data):
-    #     if not self.timetrials_only:
-    #         self.obstacles_perception = data.obstacles[:]
-    #
-    #         self.obstacles = data.obstacles
-    #
-    #         # self.obstacles = data.obstacles + self.obstacles_prediction
-    #
-    #         obstacles_in_interest = []
-    #         for obs in data.obstacles:
-    #             gap = (obs.s_start - self.cur_s) % self.track_length
-    #             if gap < self.interest_horizon_m:
-    #                 obstacles_in_interest.append(obs)
-    #
-    #         self.obstacles_in_interest = obstacles_in_interest
-    # ===== HJ COMMENTED END =====
-
-    def obstacle_perception_cb(self, data):
-        """Handle obstacle perception callback with stricter filtering for static sector obstacles"""
-        # ===== HJ ADDED: Apply stricter distance check for static obstacles in static sectors =====
-        if not self.timetrials_only:
-            self.obstacles_perception = data.obstacles[:]
-            self.obstacles = data.obstacles
-
-            # Static obstacles in static sectors with high TTL should only be "in interest" when very close
-            # This prevents TRAILING state from engaging too early for these obstacles
-            obstacles_in_interest = []
-
-            for obs in data.obstacles:
-                gap = (obs.s_start - self.cur_s) % self.track_length
-
-                # Check if this is a static obstacle in a static sector
-                is_static_in_static_sector = obs.in_static_obs_sector and obs.is_static
-
-                # Apply different horizon based on obstacle type and global flag
-                if is_static_in_static_sector and ENABLE_STATIC_SECTOR_FILTERING:
-                    # Filtering enabled: Static obstacle in static sector uses strict 3m horizon
-                    # Only engage trailing/overtaking when close
-                    horizon = HORIZON_FOR_TTL
-                else:
-                    # Filtering disabled OR dynamic obstacle: use normal horizon (original behavior)
-                    horizon = self.interest_horizon_m
-
-                if gap < horizon:
-                    obstacles_in_interest.append(obs)
-
-            self.obstacles_in_interest = obstacles_in_interest
-        # ===== HJ ADDED END =====
-
-    def ego_prediction_cb(self, data):
-        if len(data.predictions) != 0:
-            self.ego_prediction = data.predictions
-        else:
-            self.ego_prediction = []
-        
-    def obstacle_prediction_cb(self, data):
-        if len(data.predictions) != 0:
-            self.obstacles_prediction_id = data.id
-            self.obstacles_prediction = data.predictions
-        else:
-            self.obstacles_prediction = []
-
-    def frenet_pose_cb(self, data: Odometry):
-        self.cur_s = data.pose.pose.position.x
-        self.cur_d = data.pose.pose.position.y
-        self.cur_vs = data.twist.twist.linear.x
-        if self.num_ot_points != 0:
-            self.cur_id_ot = int(self._find_nearest_ot_s())
-            
-    def odom_cb(self, data):
-        """
-        Callback function of /tracked_pose subscriber.
-
-        Parameters
-        ----------
-        data
-            Data received from /tracked_pose topic
-        """
-        x = data.pose.pose.position.x
-        y = data.pose.pose.position.y
-        theta = tf.transformations.euler_from_quaternion(
-            [data.pose.pose.orientation.x, data.pose.pose.orientation.y, data.pose.pose.orientation.z, data.pose.pose.orientation.w]
-        )[2]
-
-        self.current_position = [x, y, theta]
-
-    def dyn_param_cb(self, params: Config):
-        """
-        Notices the change in the State Machine parameters and sets
-        """
-        self.lateral_width_gb_m = rospy.get_param("dyn_statemachine/lateral_width_gb_m", 0.75)
-        self.lateral_width_ot_m = rospy.get_param("dyn_statemachine/lateral_width_ot_m", 0.3)
-        self.splini_ttl = rospy.get_param("dyn_statemachine/splini_ttl") if self.ot_planner == "spliner" else rospy.get_param("dyn_statemachine/pred_splini_ttl")
-        self.splini_ttl_counter = int(self.splini_ttl * self.rate_hz)  # convert seconds to counter
-        self.splini_hyst_timer_sec = rospy.get_param("dyn_statemachine/splini_hyst_timer_sec", 0.75)
-        self.emergency_break_horizon = rospy.get_param("dyn_statemachine/emergency_break_horizon", 1.1)
-        self.ftg_speed_mps = rospy.get_param("dyn_statemachine/ftg_speed_mps", 1.0)
-        self.ftg_timer_sec = rospy.get_param("dyn_statemachine/ftg_timer_sec", 3.0)
-        
-        self.overtaking_ttl_sec = rospy.get_param("dyn_statemachine/overtaking_ttl_sec", 3.0)
-        self.overtaking_ttl_count_threshold = int(self.overtaking_ttl_sec * self.rate_hz)
-
-
-        self.ftg_disabled = not rospy.get_param("dyn_statemachine/ftg_active", False)
-        self.force_gbtrack_state = rospy.get_param("dyn_statemachine/force_GBTRACK", False)
-        self.use_force_trailing = rospy.get_param("dyn_statemachine/use_force_trailing", False)
-
-        if self.force_gbtrack_state:
-            rospy.logwarn(f"[{self.name}] GBTRACK state force activated!!!")
-
-        rospy.logdebug(
-            "[{}] Received new parameters for state machine: lateral_width_gb_m: {}, "
-            "lateral_width_ot_m: {}, splini_ttl: {}, splini_hyst_timer_sec: {}, ftg_speed_mps: {}, "
-            "ftg_timer_sec: {}, GBTRACK_force: {}".format(
-                self.name,
-                self.lateral_width_gb_m,
-                self.lateral_width_ot_m,
-                self.splini_ttl,
-                self.splini_hyst_timer_sec,
-                self.ftg_speed_mps,
-                self.ftg_timer_sec,
-                self.force_gbtrack_state
-            )
-        )
-
-    def sector_dyn_param_cb(self, params: Config):
-        """
-        Notices the change in the parameters and sets no/only ftg zones
-        """
-        # reset ftg zones
-        self.only_ftg_zones = []
-        # update ftg zones
-
-        for i in range(self.n_sectors):
-            self.sectors_params[f"Sector{i}"]["only_FTG"] = params.bools[2 * i + 1].value
-            if self.sectors_params[f"Sector{i}"]["only_FTG"]:
-                self.only_ftg_zones.append(
-                    [self.sectors_params[f"Sector{i}"]["start"], self.sectors_params[f"Sector{i}"]["end"]]
-                )
-
-    def ot_dyn_param_cb(self, params: Config):
-        """
-        Notices the change in the parameters and sets overtaking zones
-        """
-        # reset overtake zones
-        self.overtake_zones = []
-        # update overtake zones
-        try:
-            for i in range(self.n_ot_sectors):
-                self.ot_sectors_params[f"Overtaking_sector{i}"]["ot_flag"] = params.bools[i + 1].value
-                # add start and end index of the sector
-                if self.ot_sectors_params[f"Overtaking_sector{i}"]["ot_flag"]:
-                    self.overtake_zones.append(
-                        [
-                            self.ot_sectors_params[f"Overtaking_sector{i}"]["start"],
-                            self.ot_sectors_params[f"Overtaking_sector{i}"]["end"] + 1,
-                        ]
-                    )
-        except IndexError as e:
-            raise IndexError(f"[State Machine] Error in overtaking sector numbers. \nTry switching map with the script in stack_master/scripts and re-source in every terminal. \nError thrown: {e}")
-
-        self.ot_begin_margin = params.doubles[2].value  # Choose the dyn ot param value
-        rospy.logwarn(f"[{self.name}] Using OT beginning { self.ot_begin_margin}[m] from param: {params.doubles[2].name}"        )
-        # Spline new OT if they exist already
-        self.recompute_ot_spline = True
-
-    def merger_cb(self, data):
-        self.merger = data.data
-
-    def force_trailing_cb(self, data):
-        if self.use_force_trailing:
-            self.force_trailing = data.data
-        else:
-            self.force_trailing = False
-
-    def fail_trailing_cb(self, data):
-        self.fail_trailing = data.data
+    # NOTE: 24개 ROS Subscriber callback 은 CallbackMixin 으로 이동.
+    # ENABLE_STATIC_SECTOR_FILTERING / HORIZON_FOR_TTL 도 함께 이동.
 
     ######################################
     # ATTRIBUTES/CONDITIONS CALCULATIONS #
@@ -795,22 +185,11 @@ class StateMachine:
         When called from SmartStaticChecker, uses parent's GB cur_s instead of Fixed cur_s.
         """
         ftg_only = False
-        # check if the car is in a ftg only zone, but only if there is an only ftg zone
+        # zones 는 GB raceline waypoint 인덱스 기준 — gb_cur_s/gb_waypoints_dist property 사용
         if len(self.only_ftg_zones) != 0:
-            # Use GB Frenet coordinates for zone check (zones are GB raceline based)
-            if hasattr(self, 'parent'):
-                # SmartStaticChecker - use parent's GB coordinates
-                cur_s_for_zone = self.parent.cur_s
-                waypoints_dist_for_zone = self.parent.waypoints_dist
-            else:
-                # StateMachine - use own GB coordinates
-                cur_s_for_zone = self.cur_s
-                waypoints_dist_for_zone = self.waypoints_dist
-
             for sector in self.only_ftg_zones:
-                if sector[0] <= cur_s_for_zone / waypoints_dist_for_zone <= sector[1]:
+                if sector[0] <= self.gb_cur_s / self.gb_waypoints_dist <= sector[1]:
                     ftg_only = True
-                    # rospy.logwarn(f"[{self.name}] IN FTG ONLY ZONE")
                     break  # cannot be in two ftg zones
         return ftg_only
     # ===== HJ MODIFIED END =====
@@ -866,32 +245,18 @@ class StateMachine:
 
     # ===== HJ MODIFIED: Always use GB Frenet coordinates for zone checks =====
     def _check_ot_sector(self) -> bool:
-        """Check if in overtake zone using GB raceline coordinates
+        """OT zone 진입 여부.
 
-        Zones are defined using GB raceline waypoint indices.
-        When called from SmartStaticChecker, uses parent's GB cur_s instead of Fixed cur_s.
+        결정 로직(zone matching)은 path_checker.is_in_overtaking_zone 으로 위임.
+        zone 은 GB raceline 기준이라 gb_cur_s/gb_waypoints_dist property 사용.
         """
-        # self.ot_section_check_pub.publish(True)
-        # return True
-
-        # Use GB Frenet coordinates for zone check (zones are GB raceline based)
-        if hasattr(self, 'parent'):
-            # SmartStaticChecker - use parent's GB coordinates
-            cur_s_for_zone = self.parent.cur_s
-            waypoints_dist_for_zone = self.parent.waypoints_dist
-        else:
-            # StateMachine - use own GB coordinates
-            cur_s_for_zone = self.cur_s
-            waypoints_dist_for_zone = self.waypoints_dist
-
-        for sector in self.overtake_zones:
-            if sector[0] <= cur_s_for_zone / waypoints_dist_for_zone <= sector[1]:
-                # rospy.loginfo(f"[{self.name}] In overtaking sector!")
-                self.ot_section_check_pub.publish(True)
-                return True
-        self.ot_section_check_pub.publish(False)
-
-        return False
+        in_zone = is_in_overtaking_zone(
+            s_m=self.gb_cur_s,
+            waypoints_dist=self.gb_waypoints_dist,
+            zones=self.overtake_zones,
+        )
+        self.ot_section_check_pub.publish(in_zone)
+        return in_zone
     # ===== HJ MODIFIED END =====
 
     # ===== HJ COMMENTED: Original version without distance check =====
@@ -908,43 +273,25 @@ class StateMachine:
     # ===== HJ COMMENTED END =====
 
     def _check_getting_closer(self, threshold_m=7.0) -> bool:
-        """Check if we are getting closer to obstacle in interest
+        """관심 장애물(첫 번째)이 자차에 가까워지고 있는지 판정.
 
-        For static obstacles in static sectors with high TTL:
-        - Only consider them "getting closer" when within 2m
-        - This prevents overtaking from engaging too early (far away)
-        - Coordinates with obstacles_in_interest filtering (also 2m for static sector obstacles)
+        결정 로직은 path_checker.is_getting_closer 로 위임. 정적 sector 필터링 동작은
+        전역 ENABLE_STATIC_SECTOR_FILTERING / HORIZON_FOR_TTL 그대로 유지한다.
 
         Args:
-            threshold_m: Distance threshold (used for dynamic obstacles, static sector uses 2m)
-
-        Returns:
-            True if getting closer to obstacle (considering distance for static sector obs)
+            threshold_m: 인터페이스 보존용 (현재 미사용, 호출자들이 명시적으로 넘기던 값).
         """
-        # ===== HJ MODIFIED: Add distance check for static obstacles in static sectors =====
-        if len(self.obstacles_in_interest) == 0:
-            return False
-
-        obs = self.obstacles_in_interest[0]
-
-        # Check if this is a static obstacle in a static sector
-        is_static_in_static_sector = obs.in_static_obs_sector and obs.is_static
-
-        if is_static_in_static_sector and ENABLE_STATIC_SECTOR_FILTERING:
-            # Filtering enabled: apply distance check for static obstacles in static sectors
-            # Uses threshold_m parameter (10.0 for overtaking, 7.0 for static overtaking)
-            distance = (obs.s_start - self.cur_s) % self.track_length
-
-            if distance > HORIZON_FOR_TTL:
-            # if distance > threshold_m:
-
-                # Too far away - don't engage overtaking yet
-                return False
-
-        # Close enough (or filtering disabled or dynamic obstacle): check velocity difference
-        velocity_ok = self.cur_vs - obs.vs > -0.5
-        return velocity_ok
-        # ===== HJ MODIFIED END =====
+        first_obstacle = self.obstacles_in_interest[0] if self.obstacles_in_interest else None
+        return is_getting_closer(
+            cur_s=self.cur_s,
+            cur_vs=self.cur_vs,
+            first_obstacle=first_obstacle,
+            params=GettingCloserParams(
+                horizon_for_ttl=HORIZON_FOR_TTL,
+                static_sector_filtering=ENABLE_STATIC_SECTOR_FILTERING,
+                track_length=self.track_length,
+            ),
+        )
 
 
     def _check_enemy_in_front(self) -> bool:
@@ -968,38 +315,38 @@ class StateMachine:
 
     ##################################################################
     def _check_latest_wpnts(self, src_wpnts, wpnts_data: WaypointData):
-        if src_wpnts is None or len(src_wpnts.wpnts) == 0:
-            return False
+        """수신된 trajectory 가 fresh 한지 + on_spline 한지 종합 판정.
 
-        # ===== HJ MODIFIED: Relaxed timestamp check for Smart Static =====
-        # Smart Static path is fixed and never changes, so timestamp doesn't matter after initialization
-        # Timestamp is set once at creation and kept constant to avoid conflicts with global_velocity_planner
+        timestamp/freshness 결정 로직은 path_checker.is_traj_msg_fresh 로 위임.
+        initialize_traj (wpnts_data 내부 array/list/is_init 갱신)와 _check_on_spline 호출은
+        wrapper에 남는다 (side effect / 다른 sub-check 합성).
+        """
         is_smart_static = (wpnts_data.name == 'static_avoidance_planner')
 
-        if is_smart_static:
-            # Smart Static: only check that timestamp is initialized (not zero)
-            # Once initialized, path is valid forever (never changes)
-            if src_wpnts.header.stamp.is_zero():
-                rospy.logwarn_throttle(2.0,
-                    f"[_check_latest_wpnts] Smart Static waypoints timestamp not initialized")
-                return False
-            # Otherwise always valid - path never changes
-        else:
-            # Other planners: use normal timestamp threshold check
-            time_diff = (rospy.Time.now() - src_wpnts.header.stamp).to_sec()
-            if time_diff > wpnts_data.latest_threshold:
-                return False
-        # ===== HJ MODIFIED END =====
+        is_fresh = is_traj_msg_fresh(
+            src_msg=src_wpnts,
+            now_sec=rospy.Time.now().to_sec(),
+            params=TrajFreshnessParams(
+                is_smart_static=is_smart_static,
+                latest_threshold_sec=wpnts_data.latest_threshold,
+            ),
+        )
 
+        if not is_fresh:
+            # Smart Static에서 stamp 미초기화 케이스만 별도 디버그 로그 (원본 동작 유지)
+            if is_smart_static and src_wpnts is not None and len(src_wpnts.wpnts) > 0:
+                rospy.logwarn_throttle(2.0,
+                    "[_check_latest_wpnts] Smart Static waypoints timestamp not initialized")
+            return False
+
+        # Side effect: wpnts_data 내부 array/list/is_init 갱신
         wpnts_data.initialize_traj(src_wpnts)
         on_spline = self._check_on_spline(wpnts_data)
 
-        # ===== HJ ADDED: Debug logging =====
         if not on_spline and is_smart_static:
             rospy.logwarn_throttle(2.0,
-                f"[_check_latest_wpnts] Smart Static _check_on_spline FAILED! "
-                f"(timestamp check was OK)")
-        # ===== HJ ADDED END =====
+                "[_check_latest_wpnts] Smart Static _check_on_spline FAILED! "
+                "(timestamp check was OK)")
 
         return on_spline
 
@@ -1050,169 +397,58 @@ class StateMachine:
     #         return emergency_break
     
     def _check_on_spline(self, wpnt_data) -> bool:
-        if wpnt_data.is_init:
+        """자차가 wpnt spline 위에 있는지 판정.
+
+        결정 로직은 path_checker.is_on_spline 으로 위임. 디버그 로깅은 wrapper에 남는다.
+        """
+        result = is_on_spline(
+            cur_s=self.cur_s,
+            current_position_xy=np.asarray(self.current_position[:2]),
+            waypoints=wpnt_data,
+            params=OnSplineParams(
+                track_length=self.track_length,
+                front_horizon_thres_m=wpnt_data.on_spline_front_horizon_thres_m,
+                min_dist_thres_m=wpnt_data.on_spline_min_dist_thres_m,
+            ),
+        )
+
+        # ===== HJ ADDED: Debug logging for failed checks =====
+        if not result and wpnt_data.is_init:
             gap = (wpnt_data.list[-1].s_m - self.cur_s) % self.track_length
-            min_dist = np.min(np.linalg.norm(wpnt_data.array[:, 0:2] - self.current_position[:2], axis=1))
+            min_dist = np.min(
+                np.linalg.norm(wpnt_data.array[:, 0:2] - self.current_position[:2], axis=1)
+            )
+            rospy.logwarn_throttle(2.0,
+                f"[DEBUG {self.role_tag} _check_on_spline FAIL] planner={wpnt_data.name}, "
+                f"gap={gap:.2f}m (need>{wpnt_data.on_spline_front_horizon_thres_m:.2f}): "
+                f"{gap > wpnt_data.on_spline_front_horizon_thres_m}, "
+                f"min_dist={min_dist:.3f}m (need<{wpnt_data.on_spline_min_dist_thres_m:.3f}): "
+                f"{min_dist < wpnt_data.on_spline_min_dist_thres_m}")
+        # ===== HJ ADDED END =====
 
-            # ===== HJ ADDED: Debug logging for failed checks =====
-            is_smart_helper = hasattr(self, 'parent')
-            gap_ok = gap > wpnt_data.on_spline_front_horizon_thres_m
-            dist_ok = min_dist < wpnt_data.on_spline_min_dist_thres_m
-
-            if not (gap_ok and dist_ok):
-                tag = "HELPER" if is_smart_helper else "PARENT"
-                rospy.logwarn_throttle(2.0,
-                    f"[DEBUG {tag} _check_on_spline FAIL] planner={wpnt_data.name}, "
-                    f"gap={gap:.2f}m (need>{wpnt_data.on_spline_front_horizon_thres_m:.2f}): {gap_ok}, "
-                    f"min_dist={min_dist:.3f}m (need<{wpnt_data.on_spline_min_dist_thres_m:.3f}): {dist_ok}")
-            # ===== HJ ADDED END =====
-
-            if gap_ok and dist_ok:
-                return True
-        return False
+        return result
     
     def _check_free_frenet(self, wpnts_data) -> bool:
-        is_free = True
-        closest_obs = None
-        # min_gap = None
-        min_gap = 2.0
-        # Slightly different for spliner
-        min_horizon = wpnts_data.min_horizon
-        max_horizon = wpnts_data.max_horizon
-        is_gb_track_wpnts = wpnts_data.is_gb_track_wpnts
-        is_ot_wpnts = wpnts_data.is_ot_wpnts
-        
-        free_scaling_reference_distance_m = wpnts_data.free_scaling_reference_distance_m
-        lateral_width_m = wpnts_data.lateral_width_m
-        
-        obstacles = self.cur_obstacles_in_interest
-        obstacle_predictions = self.obstacles_prediction
-        # ego_prediction = self.ego_prediction
-        safety_factor_sec = 0.5
+        """path_checker.check_free_frenet 순수 함수로 위임.
 
-        if wpnts_data.is_init:
-            max_gap = (wpnts_data.array[-1,2] - self.cur_s) % self.max_s
-            for obs in obstacles:
-                obs_s = obs.s_center
-                # Wrapping madness to check if infront
-                gap = (obs_s - self.cur_s) % self.max_s
-                relative_vs = self.cur_vs - obs.vs
-                clip_vs  = max(relative_vs, 0.5)
-                ttc = (gap - self.pars["veh_params"]["length"]) / clip_vs
-                # tt0 = (gap + self.pars["veh_params"]["length"]) / clip_vs
-                tt0 = (gap + 0.3 * self.pars["veh_params"]["length"]) / clip_vs
-                # ttc = gap / self.cur_vs
-                # rospy.logwarn(f'relative_vs: {relative_vs}, gap : {gap}, ttc: {gap / clip_vs}')
-                # rospy.logwarn(f'ttc: {gap / clip_vs}')
-
-                if obs.is_static:
-                    
-
-                    if not wpnts_data.is_closed and gap > max_gap:   # Closed Wpnts is Short!!
-                        is_free = False
-                        if closest_obs is None or min_gap > gap:
-                            closest_obs = obs
-                            min_gap = gap
-
-
-                    elif gap < max_horizon: # main
-                        obs_d = obs.d_center
-                        # Get d wrt to mincurv from the overtaking line
-                        ot_d = 0
-                        if not is_gb_track_wpnts:
-                            avoid_wpnt_idx = np.argmin(abs(wpnts_data.array[:,2] - obs_s))
-                            ot_d = wpnts_data.list[avoid_wpnt_idx].d_m
-                        min_dist = abs(ot_d - obs_d)
-                        
-                        free_dist = min_dist - obs.size/2 - self.gb_ego_width_m /2
-
-                        scaling_factor = np.clip(gap / free_scaling_reference_distance_m, 0.0, 1.0)
-                        # rospy.logwarn(f"free_dist: {free_dist}")
-                        # rospy.logwarn(f"lateral_width_m: {lateral_width_m * scaling_factor}")
-                        if free_dist < lateral_width_m * scaling_factor:
-                            is_free = False
-                            rospy.loginfo("[State Machine] FREE False, obs dist to ot lane: {} m".format(free_dist))
-                            # rospy.logwarn(f"[State Machine] FREE False, free space: {free_dist}, lateral_width_m: {lateral_width_m}, scaling_factor: {scaling_factor} m")
-                            if closest_obs is None or min_gap > gap:
-                                closest_obs = obs
-                                min_gap = gap
-                            # break
-                else:
-                    # gap = (obs.s_center - self.cur_s) % self.max_s
-                    # rospy.logwarn(len(obstacle_predictions))
-                    if len(obstacle_predictions) != 0 and self.obstacles_prediction_id == obs.id:
-
-                        start_idx = 0
-                        end_idx = len(obstacle_predictions)
-
-                        if is_ot_wpnts:
-                            if ttc > 0:
-                                start_idx = min(int(ttc / 0.05), len(obstacle_predictions))
-                            if tt0 > 0:
-                                end_idx = min(int(tt0 / 0.05), len(obstacle_predictions))
-
-
-                            # rospy.logwarn(f"start_idx: {start_idx}, end_idx: {end_idx}" )
-
-                        for obs_pred in obstacle_predictions[start_idx:end_idx]:
-                            wpnt_idx = np.argmin(abs(wpnts_data.array[:,2] - obs_pred.pred_s))
-                            wpnt_d = wpnts_data.list[wpnt_idx].d_m
-                            min_dist = abs(wpnt_d - obs_pred.pred_d)
-                            free_dist = min_dist - obs.size/2 - self.gb_ego_width_m/2
-                            scaling_factor = np.clip(gap / free_scaling_reference_distance_m, 0.0, 1.0)
-                            if is_ot_wpnts:
-                                rospy.logwarn(f"free_dist: {free_dist}, lateral_width_m: {lateral_width_m}, scaling_factor: {scaling_factor}, obs.size: {obs.size}, wpnt_d:{wpnt_d}, obs_pred.pred_d: {obs_pred.pred_d} " )
-                            if free_dist < lateral_width_m * scaling_factor:
-                                is_free = False
-                                if closest_obs is None or min_gap > gap:
-                                    closest_obs = obs
-                                    min_gap = gap
-
-                        # if is_gb_track_wpnts:
-                        #     for i in range(int(len(obstacle_predictions)/2)):
-                        #         d_gap = abs(obstacle_predictions[i].pred_d)
-                        #         if d_gap < 0.4 and closest_obs is None:
-                        #             is_free = False
-                        #             closest_obs = obs
-                        # else:
-                        #     for obs_pred in obstacle_predictions[int(len(obstacle_predictions)*0.5):]:
-                        #         avoid_wpnt_idx = np.argmin(abs(wpnts_data.array[:,2] - obs_pred.pred_s))
-                        #         ot_d = wpnts_data.list[avoid_wpnt_idx].d_m
-                        #         min_dist = abs(ot_d - obs_pred.pred_d)
-                        #         free_dist = min_dist - obs.size/2 - self.gb_ego_width_m/2
-                        #         scaling_factor = np.clip(gap / free_scaling_reference_distance_m, 0.0, 1.0)
-                        #         if free_dist < lateral_width_m * scaling_factor:
-                        #             is_free = False
-                        #             if closest_obs is None or min_gap > gap:
-                        #                 closest_obs = obs
-                        #                 min_gap = gap
-                    else:
-                        if not wpnts_data.is_closed and gap > max_gap:
-                            is_free = False
-                            if closest_obs is None or min_gap > gap:
-                                closest_obs = obs
-                                min_gap = gap
-                        elif gap < max_horizon:
-                            ot_d = 0
-                            if not is_gb_track_wpnts:
-                                avoid_wpnt_idx = np.argmin(abs(wpnts_data.array[:,2] - obs.s_center))
-                                ot_d = wpnts_data.list[avoid_wpnt_idx].d_m
-                            min_dist = abs(ot_d - obs.d_center)
-                            
-                            free_dist = min_dist - obs.size/2 - self.gb_ego_width_m/2
-                            
-                            scaling_factor = np.clip(gap / free_scaling_reference_distance_m, 0.0, 1.0)
-                            if free_dist < lateral_width_m * scaling_factor:
-                                is_free = False
-                                if closest_obs is None or min_gap > gap:
-                                    closest_obs = obs
-                                    min_gap = gap
-        else:
-            is_free = True
-        
-        wpnts_data.closest_target = closest_obs
-        wpnts_data.closest_gap = min_gap
-        return is_free
+        side effect (wpnts_data.closest_target / closest_gap 갱신) 만 wrapper에서 처리하여
+        외부 호출자의 동작은 변하지 않게 유지한다.
+        """
+        result = check_free_frenet(
+            ego=EgoFrenetState(s=self.cur_s, vs=self.cur_vs),
+            waypoints=wpnts_data,
+            obstacles=self.cur_obstacles_in_interest,
+            obstacle_predictions=self.obstacles_prediction,
+            obstacle_prediction_id=self.obstacles_prediction_id,
+            params=FrenetCheckParams(
+                max_s=self.max_s,
+                veh_length=self.pars["veh_params"]["length"],
+                ego_width=self.gb_ego_width_m,
+            ),
+        )
+        wpnts_data.closest_target = result.closest_obstacle
+        wpnts_data.closest_gap = result.closest_gap
+        return result.is_free
 
     def _check_free_cartesian(self, wpnts_data) -> bool:
         is_free = True
@@ -1227,49 +463,22 @@ class StateMachine:
         obstacles = self.cur_obstacles_in_interest
         if wpnts_data.is_init:
             for obs in obstacles:
-                # if obs.is_static:
-                if True:
-                    obs_s = obs.s_center
-                    # Wrapping madness to check if infront
-                    gap = (obs_s - self.cur_s) % self.max_s
+                obs_s = obs.s_center
+                # 자차 기준 wrap-around gap
+                gap = (obs_s - self.cur_s) % self.max_s
 
-                    if gap < max_horizon or min_horizon < (gap - self.max_s):
-                        dists = np.linalg.norm(wpnts_data.array[:,0:2] - np.array([obs.x_m, obs.y_m]), axis=1)
-                        min_dist = np.min(dists)
-                        
-                        free_dist = min_dist - obs.size/2 - self.gb_ego_width_m /2
-                        
-                        scaling_factor = np.clip(gap / free_scaling_reference_distance_m, 0.0, 1.0)
+                if gap < max_horizon or min_horizon < (gap - self.max_s):
+                    dists = np.linalg.norm(wpnts_data.array[:, 0:2] - np.array([obs.x_m, obs.y_m]), axis=1)
+                    min_dist = np.min(dists)
+                    free_dist = min_dist - obs.size / 2 - self.gb_ego_width_m / 2
+                    scaling_factor = np.clip(gap / free_scaling_reference_distance_m, 0.0, 1.0)
 
-                        # rospy.logwarn(scaling_factor)
-                        if free_dist < lateral_width_m * scaling_factor:
-                            is_free = False
-                            if closest_obs is None or min_gap > gap:
-                                closest_obs = obs
-                                min_gap = gap
-                            rospy.loginfo(f"[{self.name}] RECOVERY_FREE False, obs dist to recovery lane: {min_dist} m")
-                else:
-                    pass
-                    # obs_s = obs.s_center
-                    # # Wrapping madness to check if infront
-                    # gap = (obs_s - self.cur_s) % self.max_s
-                    # if gap < horizon:
-                    #     obs_d = obs.d_center
-                    #     # Get d wrt to mincurv from the overtaking line
-                    #     avoid_wpnt_idx = np.argmin(
-                    #         np.array([abs(avoid_s.s_m - obs_s) for avoid_s in self.last_valid_avoidance_wpnts.wpnts])
-                    #     )
-                    #     ot_d = self.last_valid_avoidance_wpnts.wpnts[avoid_wpnt_idx].d_m
-                    #     ot_obs_dist = ot_d - obs_d
-                    #     # if abs(ot_obs_dist) - obs.size/2 < self.lateral_width_ot_m:
-                    #     if True:
-                    #         is_free = False
-                    #         rospy.loginfo("[State Machine] O_FREE False, obs dist to ot lane: {} m".format(ot_obs_dist))
-                    #         if closest_obs is None or min_gap > gap:
-                    #             closest_obs = obs
-                    #             min_gap = gap
-                    
-                    
+                    if free_dist < lateral_width_m * scaling_factor:
+                        is_free = False
+                        if closest_obs is None or min_gap > gap:
+                            closest_obs = obs
+                            min_gap = gap
+                        rospy.loginfo(f"[{self.name}] RECOVERY_FREE False, obs dist to recovery lane: {min_dist} m")
         else:
             is_free = True
         wpnts_data.closest_target = closest_obs
@@ -1317,90 +526,86 @@ class StateMachine:
         return False
     
     def _check_overtaking_mode(self) -> bool:
-        # ===== HJ ADDED: Debug logging =====
-        ot_sector_check = self._check_ot_sector()
-        closer_check = self._check_getting_closer(threshold_m = 10.0)
-        latest_check = self._check_latest_wpnts(self.avoidance_wpnts, self.cur_avoidance_wpnts)
-        free_check = self._check_free_frenet(self.cur_avoidance_wpnts)
+        """동적 OT 모드 진입 여부 결정.
 
-        is_smart_helper = hasattr(self, 'parent')
-        tag = "HELPER" if is_smart_helper else "PARENT"
+        결정 로직은 path_checker.should_engage_overtaking 으로 위임. 진입 시 wrapper에서
+        명시적으로 self.static_overtaking_mode = False 세팅.
+        """
+        checks = OvertakingModeChecks(
+            in_ot_sector=self._check_ot_sector(),
+            is_getting_closer=self._check_getting_closer(threshold_m=10.0),
+            wpnts_are_latest=self._check_latest_wpnts(self.avoidance_wpnts, self.cur_avoidance_wpnts),
+            path_is_free=self._check_free_frenet(self.cur_avoidance_wpnts),
+        )
 
+        # 디버그 로그
         wpnts_info = "None"
         if self.avoidance_wpnts is not None:
             wpnts_info = f"exists(len={len(self.avoidance_wpnts.wpnts)})"
-
         debug_log_on_change(
-            f"{tag}_check_OT",
-            ot_sector=ot_sector_check,
-            closer=closer_check,
-            latest=latest_check,
-            free=free_check,
+            f"{self.role_tag}_check_OT",
+            ot_sector=checks.in_ot_sector,
+            closer=checks.is_getting_closer,
+            latest=checks.wpnts_are_latest,
+            free=checks.path_is_free,
             wpnts_avail=self.avoidance_wpnts is not None,
             wpnts=wpnts_info,
             num_obs=len(self.obstacles_in_interest)
         )
-        # ===== HJ ADDED END =====
 
-        if ot_sector_check and closer_check and latest_check and free_check:
+        if should_engage_overtaking(checks):
             self.static_overtaking_mode = False
             return True
-        else:
-            return False
+        return False
         
     def _check_static_overtaking_mode(self) -> bool:
-        # ===== HJ ADDED: Debug logging =====
-        vs_check = self.cur_vs < MAX_VEL_RIGHT_BEFORE_STATIC_OT
-        closer_check = self._check_getting_closer(threshold_m = 7.0)
-        latest_check = self._check_latest_wpnts(self.static_avoidance_wpnts, self.cur_static_avoidance_wpnts)
-        free_check = self._check_free_frenet(self.cur_static_avoidance_wpnts)
+        """정적 OT 모드 진입 여부 결정.
 
-        # Determine if this is smart_helper or parent for logging
-        is_smart_helper = hasattr(self, 'parent')  # SmartStaticChecker has parent attribute
-        tag = "HELPER" if is_smart_helper else "PARENT"
+        결정 로직은 path_checker.should_engage_static_overtaking 으로 위임. 진입 시 wrapper에서
+        명시적으로 self.static_overtaking_mode = True 세팅.
+        """
+        checks = StaticOvertakingChecks(
+            velocity_safe=self.cur_vs < MAX_VEL_RIGHT_BEFORE_STATIC_OT,
+            is_getting_closer=self._check_getting_closer(threshold_m=7.0),
+            wpnts_are_latest=self._check_latest_wpnts(self.static_avoidance_wpnts, self.cur_static_avoidance_wpnts),
+            path_is_free=self._check_free_frenet(self.cur_static_avoidance_wpnts),
+        )
 
-        # Get wpnts info
+        # 디버그 로그
         wpnts_info = "None"
         if self.static_avoidance_wpnts is not None:
             wpnts_info = f"exists(len={len(self.static_avoidance_wpnts.wpnts)})"
-
-        # Use debug_log_on_change for logging
         debug_log_on_change(
-            f"{tag}_check_static_OT",
+            f"{self.role_tag}_check_static_OT",
             vs=round(self.cur_vs, 2),
-            vs_ok=vs_check,
-            closer=closer_check,
-            latest=latest_check,
-            free=free_check,
+            vs_ok=checks.velocity_safe,
+            closer=checks.is_getting_closer,
+            latest=checks.wpnts_are_latest,
+            free=checks.path_is_free,
             wpnts_avail=self.static_avoidance_wpnts is not None,
             wpnts=wpnts_info,
             num_obs=len(self.obstacles_in_interest)
         )
-        # ===== HJ ADDED END =====
 
-        if vs_check and closer_check and latest_check and free_check:
+        if should_engage_static_overtaking(checks):
             self.static_overtaking_mode = True
             return True
-        else:
-            return False
+        return False
 
     def _check_overtaking_mode_sustainability(self) -> bool:
+        """현재 OT 모드(static/dynamic)의 경로가 여전히 사용 가능한지 판정."""
         if self.static_overtaking_mode:
-            if (
-                self._check_availability(self.static_avoidance_wpnts, self.cur_static_avoidance_wpnts)
-                and self._check_free_frenet(self.cur_static_avoidance_wpnts)
-            ):
-                return True
+            wpnts_msg = self.static_avoidance_wpnts
+            wpnts_data = self.cur_static_avoidance_wpnts
         else:
-            # if self._check_ot_sector():
-            if True:
-                if self._check_availability(self.avoidance_wpnts, self.cur_avoidance_wpnts):
-                    rospy.logwarn("AVAILABLE")
-                    if self._check_free_frenet(self.cur_avoidance_wpnts):
-                        # rospy.logwarn("OFREE")
-                        return True
+            wpnts_msg = self.avoidance_wpnts
+            wpnts_data = self.cur_avoidance_wpnts
 
-        return False
+        if not self._check_availability(wpnts_msg, wpnts_data):
+            return False
+        if not self.static_overtaking_mode:
+            rospy.logwarn("AVAILABLE")  # 원본의 dynamic 분기 로그 보존
+        return self._check_free_frenet(wpnts_data)
 
     # def _check_on_merger(self) -> bool:
     #     if self.merger is not None:
@@ -1738,13 +943,8 @@ class StateMachine:
         Uses Fixed Frenet cur_s from smart_helper for accurate positioning.
         """
         if self.cur_smart_static_avoidance_wpnts.is_init:
-            # ===== HJ MODIFIED: Use last waypoint's s_m as track length =====
-            # For closed loop, last waypoint's arc length is the total track length
-            track_length = self.cur_smart_static_avoidance_wpnts.list[-1].s_m
-
-            # Use Fixed Frenet cur_s from smart_helper (matches wpnt.s_m coordinate system)
+            # Fixed Frenet cur_s (smart_helper) — wpnt.s_m 와 같은 좌표계
             cur_s_fixed = self.smart_helper.cur_s
-            # ===== HJ MODIFIED END =====
 
             # ===== HJ FIXED: Use GlobalTracking-style rounding for closest waypoint =====
             # Round to nearest waypoint index (same approach as GlobalTracking)
@@ -1785,209 +985,9 @@ class StateMachine:
 
         # return splini_glob
 
-    #######
-    # VIZ #
-    #######
-
-    def _pub_local_wpnts(self, wpts):
-        mrks = MarkerArray()
-        del_mrk = Marker()
-        del_mrk.header.stamp = rospy.Time.now()
-        del_mrk.action = Marker.DELETEALL
-        mrks.markers.append(del_mrk)
-        self.vis_loc_wpnt_pub.publish(mrks)
-
-        loc_markers = MarkerArray()
-        loc_wpnts = WpntArray()
-        loc_wpnts.wpnts = wpts
-        loc_wpnts.header.stamp = rospy.Time.now()
-        loc_wpnts.header.frame_id = "map"
-
-        # Original: sphere markers with speed color
-        vx_vals = [wpnt.vx_mps for wpnt in loc_wpnts.wpnts]
-        vx_min = min(vx_vals) if vx_vals else 0.0
-        vx_max = max(vx_vals) if vx_vals else 1.0
-        for i, wpnt in enumerate(loc_wpnts.wpnts):
-            mrk = Marker()
-            mrk.header.frame_id = "map"
-            mrk.type = mrk.SPHERE
-            mrk.scale.x = 0.15
-            mrk.scale.y = 0.15
-            mrk.scale.z = 0.15
-            mrk.color.a = 1.0
-            t = (wpnt.vx_mps - vx_min) / (vx_max - vx_min) if vx_max > vx_min else 0.5
-            mrk.color.r = max(0.0, min(1.0, 1.0 - 2.0 * (t - 0.5)))
-            mrk.color.g = max(0.0, min(1.0, 2.0 * t))
-            mrk.color.b = 0.0
-
-            mrk.id = i
-            mrk.pose.position.x = wpnt.x_m
-            mrk.pose.position.y = wpnt.y_m
-            mrk.pose.position.z = wpnt.z_m
-            mrk.pose.orientation.w = 1
-            loc_markers.markers.append(mrk)
-
-        # if len(loc_wpnts.wpnts) == 0:
-        #     rospy.logwarn(f"[{self.name}] No local waypoints published...")
-        # else:
-
-
-        self.loc_wpnt_pub.publish(loc_wpnts)
-        self.vis_loc_wpnt_pub.publish(loc_markers)
-
-        # 3D: velocity cylinder markers (z = velocity, same scale as global)
-        VEL_SCALE = 0.1317
-        vel_markers = MarkerArray()
-        for i, wpnt in enumerate(loc_wpnts.wpnts):
-            mrk = Marker()
-            mrk.header.frame_id = "map"
-            mrk.header.stamp = rospy.Time.now()
-            mrk.type = Marker.CYLINDER
-            mrk.id = i
-            mrk.scale.x = 0.1
-            mrk.scale.y = 0.1
-            height = max(wpnt.vx_mps * VEL_SCALE, 0.02)
-            mrk.scale.z = height
-            mrk.color.a = 0.7
-            t = (wpnt.vx_mps - vx_min) / (vx_max - vx_min) if vx_max > vx_min else 0.5
-            mrk.color.r = max(0.0, min(1.0, 1.0 - 2.0 * (t - 0.5)))
-            mrk.color.g = max(0.0, min(1.0, 2.0 * t))
-            mrk.color.b = 0.0
-            mrk.pose.position.x = wpnt.x_m
-            mrk.pose.position.y = wpnt.y_m
-            mrk.pose.position.z = wpnt.z_m + height * 0.5
-            mrk.pose.orientation.w = 1
-            vel_markers.markers.append(mrk)
-        self.vis_loc_vel_pub.publish(vel_markers)
-
-    def visualize_state(self, state: str):
-        """
-        Function that visualizes the state of the car by displaying a colored cube in RVIZ.
-
-        Parameters
-        ----------
-        action
-            Current state of the car to be displayed
-        """
-        if self.first_visualization:
-            self.first_visualization = False
-            x0 = self.cur_gb_wpnts.list[0].x_m
-            y0 = self.cur_gb_wpnts.list[0].y_m
-            x1 = self.cur_gb_wpnts.list[1].x_m
-            y1 = self.cur_gb_wpnts.list[1].y_m
-            # compute normal vector of 125% length of trackboundary but to the left of the trajectory
-            xy_norm = (
-                -np.array([y1 - y0, x0 - x1]) / np.linalg.norm([y1 - y0, x0 - x1]) * 1.25 * self.cur_gb_wpnts.list[0].d_left
-            )
-
-            self.x_viz = x0 + xy_norm[0]
-            self.y_viz = y0 + xy_norm[1]
-
-        mrk = Marker()
-        mrk.type = mrk.SPHERE
-        mrk.id = 1
-        mrk.header.frame_id = "map"
-        mrk.header.stamp = rospy.Time.now()
-        mrk.color.a = 1.0
-        mrk.pose.position.x = self.x_viz
-        mrk.pose.position.y = self.y_viz
-        mrk.pose.position.z = 0
-        mrk.pose.orientation.w = 1
-        mrk.scale.x = 1
-        mrk.scale.y = 1
-        mrk.scale.z = 1
-
-        # Set color and log info based on the state of the car
-        if state == "GB_TRACK":
-            mrk.color.b = 1.0
-        elif state == "OVERTAKE":
-            mrk.color.r = 1.0
-            mrk.color.g = 0.0
-            mrk.color.b = 0.0
-        elif state == "TRAILING":
-            mrk.color.r = 1.0
-            mrk.color.g = 1.0
-            mrk.color.b = 0.0
-        elif state == "ATTACK":
-            mrk.color.r = 1.0
-            mrk.color.g = 0.0
-            mrk.color.b = 1.0
-        elif state == "FTGONLY":
-            mrk.color.r = 1.0
-            mrk.color.g = 1.0
-            mrk.color.b = 1.0
-        elif state == "RECOVERY":
-            mrk.color.r = 0.0
-            mrk.color.g = 1.0
-            mrk.color.b = 0.0
-        # ===== HJ ADDED: SMART_STATIC state marker =====
-        elif state == "SMART_STATIC":
-            mrk.color.r = 0.0
-            mrk.color.g = 1.0
-            mrk.color.b = 1.0  # Cyan
-        # ===== HJ ADDED END =====
-        else:
-            mrk.color.r = 1.0
-            mrk.color.g = 1.0
-            mrk.color.b = 1.0
-        self.state_mrk.publish(mrk)
-
-        # ===== HJ ADDED: Publish waypoint source + battery voltage text marker =====
-        # Get waypoint source string (from transition result)
-        wpnt_src_str = str(self.local_wpnts_src).replace("StateType.", "")
-
-        # Format battery voltage
-        voltage_str = f"{self.cur_volt:.1f}V" if hasattr(self, 'cur_volt') else "~V"
-
-        # Center both lines to the same width (use longer string as reference)
-        max_len = max(len(wpnt_src_str), len(voltage_str))
-        # Add extra padding for better centering
-        padding = 4
-        wpnt_centered = wpnt_src_str.center(max_len + padding)
-        voltage_centered = voltage_str.center(max_len + padding)
-
-        # Text marker (black text, smaller) - waypoint source + battery voltage
-        text_mrk = Marker()
-        text_mrk.type = Marker.TEXT_VIEW_FACING
-        text_mrk.id = 2  # Different ID from sphere marker
-        text_mrk.header.frame_id = "map"
-        text_mrk.header.stamp = rospy.Time.now()
-        text_mrk.pose.position.x = self.x_viz
-        text_mrk.pose.position.y = self.y_viz
-        text_mrk.pose.position.z = 1.5  # Above the sphere
-        text_mrk.pose.orientation.w = 1
-        text_mrk.scale.z = 0.2  # Smaller text height
-        text_mrk.color.r = 0.0  # Black text
-        text_mrk.color.g = 0.0
-        text_mrk.color.b = 0.0
-        text_mrk.color.a = 1.0
-        text_mrk.text = f"{wpnt_centered}\n {voltage_centered}"  # Both centered
-
-        self.state_wpnts_src_marker.publish(text_mrk)
-        # ===== HJ ADDED END =====
-
-    def publish_not_ready_marker(self):
-        """Publishes a text marker that warn the user that the car is not ready to run"""
-        mrk = Marker()
-        mrk.type = mrk.TEXT_VIEW_FACING
-        mrk.id = 1
-        mrk.header.frame_id = "map"
-        mrk.header.stamp = rospy.Time.now()
-        mrk.color.a = 1.0
-        mrk.color.r = 1.0
-        mrk.color.g = 0.0
-        mrk.color.b = 0.0
-        mrk.pose.position.x = np.mean(
-            [wpnt.x_m for wpnt in self.cur_gb_wpnts.list]
-        )  # publish in the center of the track, to avoid not seeing it
-        mrk.pose.position.y = np.mean([wpnt.y_m for wpnt in self.cur_gb_wpnts.list])
-        mrk.pose.position.z = 1.0
-        mrk.pose.orientation.w = 1
-        mrk.scale.x = 4.69
-        mrk.scale.y = 4.69
-        mrk.scale.z = 4.69
-        mrk.text = "BATTERY TOO LOW!!!"
-        self.emergency_pub.publish(mrk)
+    # NOTE: visualization 메서드 (_pub_local_wpnts / visualize_state /
+    # _compute_visualization_anchor / _publish_state_text_marker /
+    # publish_not_ready_marker / _speed_to_color) 는 VisualizationMixin 으로 이동.
 
     def update_waypoints(self):
         if not self.cur_gb_wpnts.is_init:
@@ -2008,27 +1008,13 @@ class StateMachine:
 
         
     def get_overtaking_target(self):
-        # ===== HJ MODIFIED: Use appropriate Frenet coordinate system based on mode =====
-        # In Smart mode, closest_target uses Fixed Frenet (from smart_helper)
-        # In GB mode, closest_target uses GB Frenet (from self)
-        if self.smart_static_active:
-            # Smart mode: use smart_helper's Fixed Frenet based calculations
-            smart_helper = self.smart_helper
-            if smart_helper.cur_gb_wpnts.closest_target is not None:
-                return [smart_helper.cur_gb_wpnts.closest_target]
-            if smart_helper.cur_recovery_wpnts.closest_target is not None:
-                return [smart_helper.cur_recovery_wpnts.closest_target]
-            else:
-                return []
-        else:
-            # GB mode: use self's GB Frenet based calculations
-            if self.cur_gb_wpnts.closest_target is not None:
-                return [self.cur_gb_wpnts.closest_target]
-            if self.cur_recovery_wpnts.closest_target is not None:
-                return [self.cur_recovery_wpnts.closest_target]
-            else:
-                return []
-        # ===== HJ MODIFIED END =====
+        """현재 모드(Smart/GB)에 맞는 closest_target 반환 — active_helper property 로 분기 통일."""
+        helper = self.active_helper
+        if helper.cur_gb_wpnts.closest_target is not None:
+            return [helper.cur_gb_wpnts.closest_target]
+        if helper.cur_recovery_wpnts.closest_target is not None:
+            return [helper.cur_recovery_wpnts.closest_target]
+        return []
 
 
 
@@ -2043,85 +1029,50 @@ class StateMachine:
             return []
         
     def get_farthest_target(self, local_wpnts_src):
-        # ===== HJ MODIFIED: Use appropriate Frenet coordinate system based on mode =====
-        # In Smart mode, all closest_target/gap calculations use Fixed Frenet (from smart_helper)
-        # In GB mode, all closest_target/gap calculations use GB Frenet (from self)
-        if self.smart_static_active:
-            # Smart mode: use smart_helper's Fixed Frenet based calculations
-            smart_helper = self.smart_helper
+        """현재 모드의 데이터 source(active_helper)에서 base wpnts 의 closest_target 으로 시작해
+        avoidance / static_avoidance / start 의 더 먼 closest_gap 으로 갱신한다.
 
-            if local_wpnts_src == StateType.SMART_STATIC and smart_helper.cur_gb_wpnts.closest_target is not None:
-                closest_target = smart_helper.cur_gb_wpnts.closest_target
-                closest_gap = smart_helper.cur_gb_wpnts.closest_gap
-                if smart_helper.cur_avoidance_wpnts.closest_target is not None and closest_gap <= smart_helper.cur_avoidance_wpnts.closest_gap:
-                    closest_gap = smart_helper.cur_avoidance_wpnts.closest_gap
-                    closest_target = smart_helper.cur_avoidance_wpnts.closest_target
-                    local_wpnts_src = StateType.OVERTAKE
-                if smart_helper.cur_static_avoidance_wpnts.closest_target is not None and closest_gap < smart_helper.cur_static_avoidance_wpnts.closest_gap:
-                    closest_gap = smart_helper.cur_static_avoidance_wpnts.closest_gap
-                    closest_target = smart_helper.cur_static_avoidance_wpnts.closest_target
-                    local_wpnts_src = StateType.OVERTAKE
-                if smart_helper.cur_start_wpnts.closest_target is not None and closest_gap < smart_helper.cur_start_wpnts.closest_gap:
-                    closest_gap = smart_helper.cur_start_wpnts.closest_gap
-                    closest_target = smart_helper.cur_start_wpnts.closest_target
-                    local_wpnts_src = StateType.START
-                return [closest_target], local_wpnts_src
+        Smart 모드에서 base 는 SMART_STATIC, GB 모드에서는 GB_TRACK. RECOVERY 는 양 모드 공통.
+        """
+        helper = self.active_helper
+        base_state = StateType.SMART_STATIC if self.smart_static_active else StateType.GB_TRACK
 
-            if local_wpnts_src == StateType.RECOVERY and smart_helper.cur_recovery_wpnts.closest_target is not None:
-                closest_target = smart_helper.cur_recovery_wpnts.closest_target
-                closest_gap = smart_helper.cur_recovery_wpnts.closest_gap
-                if smart_helper.cur_avoidance_wpnts.closest_target is not None and closest_gap < smart_helper.cur_avoidance_wpnts.closest_gap:
-                    closest_gap = smart_helper.cur_avoidance_wpnts.closest_gap
-                    closest_target = smart_helper.cur_avoidance_wpnts.closest_target
-                    local_wpnts_src = StateType.OVERTAKE
-                if smart_helper.cur_static_avoidance_wpnts.closest_target is not None and closest_gap < smart_helper.cur_static_avoidance_wpnts.closest_gap:
-                    closest_gap = smart_helper.cur_static_avoidance_wpnts.closest_gap
-                    closest_target = smart_helper.cur_static_avoidance_wpnts.closest_target
-                    local_wpnts_src = StateType.OVERTAKE
-                if smart_helper.cur_start_wpnts.closest_target is not None and closest_gap < smart_helper.cur_start_wpnts.closest_gap:
-                    closest_gap = smart_helper.cur_start_wpnts.closest_gap
-                    closest_target = smart_helper.cur_start_wpnts.closest_target
-                    local_wpnts_src = StateType.START
-                return [closest_target], local_wpnts_src
-
+        # base waypoint 결정 — local_wpnts_src 에 따라 base / recovery 갈래
+        if local_wpnts_src == base_state and helper.cur_gb_wpnts.closest_target is not None:
+            base_wpnts = helper.cur_gb_wpnts
+        elif local_wpnts_src == StateType.RECOVERY and helper.cur_recovery_wpnts.closest_target is not None:
+            base_wpnts = helper.cur_recovery_wpnts
         else:
-            # GB mode: use self's GB Frenet based calculations
-            if local_wpnts_src == StateType.GB_TRACK and self.cur_gb_wpnts.closest_target is not None:
-                closest_target = self.cur_gb_wpnts.closest_target
-                closest_gap = self.cur_gb_wpnts.closest_gap
-                if self.cur_avoidance_wpnts.closest_target is not None and closest_gap <= self.cur_avoidance_wpnts.closest_gap:
-                    closest_gap = self.cur_avoidance_wpnts.closest_gap
-                    closest_target = self.cur_avoidance_wpnts.closest_target
-                    local_wpnts_src = StateType.OVERTAKE
-                if self.cur_static_avoidance_wpnts.closest_target is not None and closest_gap < self.cur_static_avoidance_wpnts.closest_gap:
-                    closest_gap = self.cur_static_avoidance_wpnts.closest_gap
-                    closest_target = self.cur_static_avoidance_wpnts.closest_target
-                    local_wpnts_src = StateType.OVERTAKE
-                if self.cur_start_wpnts.closest_target is not None and closest_gap < self.cur_start_wpnts.closest_gap:
-                    closest_gap = self.cur_start_wpnts.closest_gap
-                    closest_target = self.cur_start_wpnts.closest_target
-                    local_wpnts_src = StateType.START
-                return [closest_target], local_wpnts_src
+            return [], local_wpnts_src
 
-            if local_wpnts_src == StateType.RECOVERY and self.cur_recovery_wpnts.closest_target is not None:
-                closest_target = self.cur_recovery_wpnts.closest_target
-                closest_gap = self.cur_recovery_wpnts.closest_gap
-                if self.cur_avoidance_wpnts.closest_target is not None and closest_gap < self.cur_avoidance_wpnts.closest_gap:
-                    closest_gap = self.cur_avoidance_wpnts.closest_gap
-                    closest_target = self.cur_avoidance_wpnts.closest_target
-                    local_wpnts_src = StateType.OVERTAKE
-                if self.cur_static_avoidance_wpnts.closest_target is not None and closest_gap < self.cur_static_avoidance_wpnts.closest_gap:
-                    closest_gap = self.cur_static_avoidance_wpnts.closest_gap
-                    closest_target = self.cur_static_avoidance_wpnts.closest_target
-                    local_wpnts_src = StateType.OVERTAKE
-                if self.cur_start_wpnts.closest_target is not None and closest_gap < self.cur_start_wpnts.closest_gap:
-                    closest_gap = self.cur_start_wpnts.closest_gap
-                    closest_target = self.cur_start_wpnts.closest_target
-                    local_wpnts_src = StateType.START
-                return [closest_target], local_wpnts_src
-        # ===== HJ MODIFIED END =====
+        closest_target = base_wpnts.closest_target
+        closest_gap = base_wpnts.closest_gap
 
-        return [], local_wpnts_src
+        # 더 먼 (큰 gap) closest_target 으로 순차 갱신
+        # 주의: GB_TRACK base 일 때만 첫 비교가 `<=` (>= 가 아니라). 원본 동작 보존.
+        first_op_le = (local_wpnts_src == base_state)
+
+        avoidance = helper.cur_avoidance_wpnts
+        if avoidance.closest_target is not None:
+            if (first_op_le and closest_gap <= avoidance.closest_gap) or \
+               (not first_op_le and closest_gap < avoidance.closest_gap):
+                closest_target = avoidance.closest_target
+                closest_gap = avoidance.closest_gap
+                local_wpnts_src = StateType.OVERTAKE
+
+        static_avoidance = helper.cur_static_avoidance_wpnts
+        if static_avoidance.closest_target is not None and closest_gap < static_avoidance.closest_gap:
+            closest_target = static_avoidance.closest_target
+            closest_gap = static_avoidance.closest_gap
+            local_wpnts_src = StateType.OVERTAKE
+
+        start = helper.cur_start_wpnts
+        if start.closest_target is not None and closest_gap < start.closest_gap:
+            closest_target = start.closest_target
+            closest_gap = start.closest_gap
+            local_wpnts_src = StateType.START
+
+        return [closest_target], local_wpnts_src
 
     
     def check_ot_cloest_target(self):
@@ -2146,131 +1097,106 @@ class StateMachine:
         # ===== HJ MODIFIED END =====       
 
     #############
-    # MAIN LOOP #
+    # MAIN LOOP HELPERS
     #############
-    def loop(self):
-        """Main loop of the state machine. It is called at a fixed rate by the
-        ROS node.
-        """
-        # do state transition (unless we want to force it into GB_TRACK via dynamic reconfigure)
-        if self.measuring:
-            start = time.perf_counter()
-            
-        self.update_waypoints()
-        # if len(self.cur_obstacles_in_interest) == 0:
+
+    def _reset_check_result_caches(self):
+        """매 loop iteration 시작 시 이전 결과 캐시 초기화."""
         self.gb_closest_target = None
-        # self.cur_recovery_wpnts.closest_target = None
         self.ot_closest_target = None
-        need_vel_planner = False
-        
         self.cur_gb_wpnts.closest_target = None
         self.cur_recovery_wpnts.closest_target = None
         self.cur_avoidance_wpnts.closest_target = None
         self.cur_static_avoidance_wpnts.closest_target = None
         self.cur_start_wpnts.closest_target = None
-        
-        # safety check
+
+    def _check_low_voltage_warning(self):
+        """배터리 전압이 임계 이하면 경고 마커 발행."""
         if self.cur_volt < self.volt_threshold:
             rospy.logerr_throttle_identical(1, f"[{self.name}] VOLTS TOO LOW, STOP THE CAR")
-            # publishes a marker that warn the user that the car is not ready to run
             self.publish_not_ready_marker()
-            
-        # ===== HJ ADDED: Log state changes =====
-        prev_state = self.cur_state
-        prev_wpnts_src = self.local_wpnts_src
-        # ===== HJ ADDED END =====
 
+    def _decide_next_state(self):
+        """다음 상태 결정. 우선순위: force_gbtrack > ftg_only_zone > 정상 transition."""
         if self.force_gbtrack_state:
-            self.cur_state = StateType.GB_TRACK
-            self.local_wpnts_src = StateType.GB_TRACK
-            # rospy.logwarn(f"[{self.name}] GBTRACK state forced!!!")
-        elif self._check_only_ftg_zone():
-            self.cur_state = StateType.FTGONLY
-            self.local_wpnts_src = StateType.FTGONLY
+            return StateType.GB_TRACK, StateType.GB_TRACK
+        if self._check_only_ftg_zone():
             rospy.logwarn(f"[{self.name}] FTGONLY sector !!!")
-        else:
-            self.cur_state, self.local_wpnts_src = self.state_transitions[self.cur_state](self)
+            return StateType.FTGONLY, StateType.FTGONLY
+        return self.state_transitions[self.cur_state](self)
 
-        # ===== HJ ADDED: Log state changes =====
-        if DEBUG_STATE_TRANSITION:
-            if prev_state != self.cur_state or prev_wpnts_src != self.local_wpnts_src:
-                mode_tag = "SMART" if self.smart_static_active else "GB"
-                rospy.logwarn(f"[STATE CHANGE {mode_tag}] {prev_state.name} → {self.cur_state.name} | wpnts: {prev_wpnts_src.name} → {self.local_wpnts_src.name}")
-        # ===== HJ ADDED END =====
+    def _log_state_change_if_debug(self, prev_state, prev_wpnts_src):
+        """state 또는 wpnts_src 가 변경됐으면 디버그 로그 (DEBUG_STATE_TRANSITION 활성 시)."""
+        if not DEBUG_STATE_TRANSITION:
+            return
+        if prev_state != self.cur_state or prev_wpnts_src != self.local_wpnts_src:
+            rospy.logwarn(
+                f"[STATE CHANGE {self.current_mode_tag}] {prev_state.name} → {self.cur_state.name} | "
+                f"wpnts: {prev_wpnts_src.name} → {self.local_wpnts_src.name}"
+            )
 
-        if self.cur_state == StateType.TRAILING:
-            self.check_ot_cloest_target()
-            self.behavior_strategy.trailing_targets, self.local_wpnts_src = self.get_farthest_target(self.local_wpnts_src)
-
-            # self.behavior_strategy.trailing_targets = self.get_traling_target()
-            # self.behavior_strategy.trailing_targets = self.get_farthest_target()
-        else:
-            self.behavior_strategy.trailing_targets = []
-        
-        self.behavior_strategy.overtaking_targets = self.get_overtaking_target()
-        # self.behavior_strategy.overtaking_targets = self.get_closest_target()
-                    
-        # self.local_wpnts.wpnts = self.states[self.local_wpnts_src](self)
-        local_wpnts = self.states[self.local_wpnts_src](self)
-
-
-        if self.cur_state == StateType.LOSTLINE:
-            self.cur_state = StateType.GB_TRACK
-
-        need_vel_planner = False
-        # get the proper local waypoints based on the new state
-        # self.behavior_strategy = BehaviorStrategy() 
+    def _publish_behavior_strategy(self, local_wpnts):
+        """BehaviorStrategy 메시지 채우고 발행."""
         self.behavior_strategy.header.stamp = rospy.Time.now()
         self.behavior_strategy.local_wpnts = local_wpnts
         self.behavior_strategy.state = self.cur_state.value
-        self.behavior_strategy.need_vel_planner = need_vel_planner
-        # self.behavior_strategy.need_vel_planner = False
-    
+        self.behavior_strategy.need_vel_planner = False
         self.behavior_strategy_pub.publish(self.behavior_strategy)
-        
+
+    # NOTE: _publish_target_marker 도 VisualizationMixin 으로 이동.
+
+    #############
+    # MAIN LOOP #
+    #############
+    def loop(self):
+        """ROS 노드가 고정 주기로 호출하는 state machine 메인 루프."""
+        if self.measuring:
+            start = time.perf_counter()
+
+        self.update_waypoints()
+        self._reset_check_result_caches()
+        self._check_low_voltage_warning()
+
+        # 다음 상태 결정 + 디버그 로그
+        prev_state, prev_wpnts_src = self.cur_state, self.local_wpnts_src
+        self.cur_state, self.local_wpnts_src = self._decide_next_state()
+        self._log_state_change_if_debug(prev_state, prev_wpnts_src)
+
+        # TRAILING 시 trailing target 계산 (그 외엔 비움)
+        if self.cur_state == StateType.TRAILING:
+            self.check_ot_cloest_target()
+            self.behavior_strategy.trailing_targets, self.local_wpnts_src = (
+                self.get_farthest_target(self.local_wpnts_src)
+            )
+        else:
+            self.behavior_strategy.trailing_targets = []
+        self.behavior_strategy.overtaking_targets = self.get_overtaking_target()
+
+        # 현재 상태에 맞는 local waypoints 생성
+        local_wpnts = self.states[self.local_wpnts_src](self)
+        if self.cur_state == StateType.LOSTLINE:
+            self.cur_state = StateType.GB_TRACK
+
+        # behavior + state + 시각화 발행
+        self._publish_behavior_strategy(local_wpnts)
         self.state_pub.publish(self.cur_state.value)
         self.visualize_state(state=self.cur_state.value)
-            
         self._pub_local_wpnts(local_wpnts)
-        # Clear FTG counter if not in TRAILING state
+
+        # TRAILING/ATTACK 이외에서는 FTG 카운터 초기화
         if self.cur_state != StateType.TRAILING and self.cur_state != StateType.ATTACK:
             self.ftg_counter = 0
-            
-        overtaking_target_mrk = Marker()
-        if len(self.behavior_strategy.overtaking_targets) != 0:
-            overtaking_target_mrk.header.frame_id = "map"
-            overtaking_target_mrk.type = Marker.SPHERE
-            overtaking_target_mrk.scale.x = 0.5
-            overtaking_target_mrk.scale.y = 0.5
-            overtaking_target_mrk.scale.z = 0.5
-            overtaking_target_mrk.color.a = 1.0
-            overtaking_target_mrk.color.b = 1.0
-            overtaking_target_mrk.pose.position.x = self.behavior_strategy.overtaking_targets[0].x_m
-            overtaking_target_mrk.pose.position.y = self.behavior_strategy.overtaking_targets[0].y_m
-            overtaking_target_mrk.pose.orientation.w = 1
-        else:
-            overtaking_target_mrk.action = Marker.DELETEALL
-        self.overtaking_marker_pub.publish(overtaking_target_mrk)
 
-        trailing_target_mrk = Marker()
-        if len(self.behavior_strategy.trailing_targets) != 0:
-            trailing_target_mrk.header.frame_id = "map"
-            trailing_target_mrk.type = Marker.SPHERE
-            trailing_target_mrk.scale.x = 0.5
-            trailing_target_mrk.scale.y = 0.5
-            trailing_target_mrk.scale.z = 0.5
-            trailing_target_mrk.color.a = 1.0
-            trailing_target_mrk.color.g = 1.0
-            trailing_target_mrk.pose.position.x = self.behavior_strategy.trailing_targets[0].x_m
-            trailing_target_mrk.pose.position.y = self.behavior_strategy.trailing_targets[0].y_m
-            trailing_target_mrk.pose.orientation.w = 1
-        else:
-            trailing_target_mrk.action = Marker.DELETEALL
-        self.trailing_marker_pub.publish(trailing_target_mrk)
+        # target 시각화 (overtaking=blue, trailing=green)
+        self._publish_target_marker(
+            self.overtaking_marker_pub, self.behavior_strategy.overtaking_targets, color_b=1.0
+        )
+        self._publish_target_marker(
+            self.trailing_marker_pub, self.behavior_strategy.trailing_targets, color_g=1.0
+        )
 
         if self.measuring:
-            end = time.perf_counter()
-            self.latency_pub.publish(1/(end - start))
+            self.latency_pub.publish(1 / (time.perf_counter() - start))
 
 if __name__ == "__main__":
     name = "state_machine"

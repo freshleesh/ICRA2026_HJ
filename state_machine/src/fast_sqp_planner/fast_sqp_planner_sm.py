@@ -42,44 +42,8 @@ if _this_dir not in _sys.path:
 import fast_sqp_planner_transitions as state_transitions
 import states
 from states_types import StateType
+from waypoint_data import WaypointData
 
-class WaypointData:
-    def __init__(self, planner_name, is_closed):
-        self.name =planner_name
-        self.node_name = "/dyn_planners_statemachine/" + self.name
-        self.list = []
-        self.array = None
-        self.stamp = None
-        self.is_init = False
-        self.is_gb_track_wpnts = False
-        self.is_ot_wpnts = False
-        self.closest_target = None
-        self.closest_gap = None
-        self.is_closed = is_closed
-        self.vel_planner_safety_factor = 1.0
-        self.dyn_sub = rospy.Subscriber(self.node_name + "/parameter_updates", Config, self.dyn_param_cb)
-        self.update_param()
-
-    def dyn_param_cb(self, config):
-        self.update_param()
-
-    def update_param(self):
-        self.min_horizon = rospy.get_param(self.node_name + "/min_horizon")
-        self.max_horizon = rospy.get_param(self.node_name + "/max_horizon")
-        self.lateral_width_m = rospy.get_param(self.node_name + "/lateral_width_m")
-        self.free_scaling_reference_distance_m = rospy.get_param(self.node_name + "/free_scaling_reference_distance_m")
-        self.latest_threshold = rospy.get_param(self.node_name + "/latest_threshold")
-        self.on_spline_front_horizon_thres_m = rospy.get_param(self.node_name + "/on_spline_front_horizon_thres_m")
-        self.on_spline_min_dist_thres_m = rospy.get_param(self.node_name + "/on_spline_min_dist_thres_m")
-        self.hyst_timer_sec = rospy.get_param(self.node_name + "/hyst_timer_sec")
-        self.killing_timer_sec = rospy.get_param(self.node_name + "/killing_timer_sec")
-
-    def initialize_traj(self, wpnt):
-        if len(wpnt.wpnts) != 0:
-            self.stamp = wpnt.header.stamp
-            self.list = wpnt.wpnts
-            self.array = np.array([[wpnt.x_m, wpnt.y_m, wpnt.s_m, wpnt.d_m] for wpnt in wpnt.wpnts])
-            self.is_init = True
 
 class StateMachine:
     """
@@ -885,27 +849,22 @@ class StateMachine:
         obstacles = self.cur_obstacles_in_interest
         if wpnts_data.is_init:
             for obs in obstacles:
-                if True:
-                    obs_s = obs.s_center
-                    # Wrapping madness to check if infront
-                    gap = (obs_s - self.cur_s) % self.max_s
+                obs_s = obs.s_center
+                # 자차 기준 wrap-around gap
+                gap = (obs_s - self.cur_s) % self.max_s
 
-                    if gap < max_horizon or min_horizon < (gap - self.max_s):
-                        dists = np.linalg.norm(wpnts_data.array[:,0:2] - np.array([obs.x_m, obs.y_m]), axis=1)
-                        min_dist = np.min(dists)
+                if gap < max_horizon or min_horizon < (gap - self.max_s):
+                    dists = np.linalg.norm(wpnts_data.array[:, 0:2] - np.array([obs.x_m, obs.y_m]), axis=1)
+                    min_dist = np.min(dists)
+                    free_dist = min_dist - obs.size / 2 - self.gb_ego_width_m / 2
+                    scaling_factor = np.clip(gap / free_scaling_reference_distance_m, 0.0, 1.0)
 
-                        free_dist = min_dist - obs.size/2 - self.gb_ego_width_m /2
-
-                        scaling_factor = np.clip(gap / free_scaling_reference_distance_m, 0.0, 1.0)
-
-                        if free_dist < lateral_width_m * scaling_factor:
-                            is_free = False
-                            if closest_obs is None or min_gap > gap:
-                                closest_obs = obs
-                                min_gap = gap
-                            rospy.loginfo(f"[{self.name}] RECOVERY_FREE False, obs dist to recovery lane: {min_dist} m")
-                else:
-                    pass
+                    if free_dist < lateral_width_m * scaling_factor:
+                        is_free = False
+                        if closest_obs is None or min_gap > gap:
+                            closest_obs = obs
+                            min_gap = gap
+                        rospy.loginfo(f"[{self.name}] RECOVERY_FREE False, obs dist to recovery lane: {min_dist} m")
         else:
             is_free = True
         wpnts_data.closest_target = closest_obs
@@ -969,20 +928,19 @@ class StateMachine:
             return False
 
     def _check_overtaking_mode_sustainability(self) -> bool:
+        """현재 OT 모드(static/dynamic)의 경로가 여전히 사용 가능한지 판정."""
         if self.static_overtaking_mode:
-            if (
-                self._check_availability(self.static_avoidance_wpnts, self.cur_static_avoidance_wpnts)
-                and self._check_free_frenet(self.cur_static_avoidance_wpnts)
-            ):
-                return True
+            wpnts_msg = self.static_avoidance_wpnts
+            wpnts_data = self.cur_static_avoidance_wpnts
         else:
-            if True:
-                if self._check_availability(self.avoidance_wpnts, self.cur_avoidance_wpnts):
-                    rospy.logwarn("AVAILABLE")
-                    if self._check_free_frenet(self.cur_avoidance_wpnts):
-                        return True
+            wpnts_msg = self.avoidance_wpnts
+            wpnts_data = self.cur_avoidance_wpnts
 
-        return False
+        if not self._check_availability(wpnts_msg, wpnts_data):
+            return False
+        if not self.static_overtaking_mode:
+            rospy.logwarn("AVAILABLE")  # 원본의 dynamic 분기 로그 보존
+        return self._check_free_frenet(wpnts_data)
 
     ################
     # HELPER FUNCS #

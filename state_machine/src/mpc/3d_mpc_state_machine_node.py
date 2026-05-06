@@ -89,49 +89,8 @@ except:
 import state_transitions_mpc as state_transitions
 import states_mpc as states
 from states_types import StateType
+from waypoint_data import WaypointData
 
-class WaypointData:
-    def __init__(self, planner_name, is_closed):
-        self.name =planner_name
-        self.node_name = "/dyn_planners_statemachine/" + self.name
-        self.list = []
-        self.array = None
-        self.stamp = None
-        self.is_init = False
-        self.is_gb_track_wpnts = False
-        self.is_ot_wpnts = False
-        # ### HJ : Phase X (refactored) — provenance tag. When the last
-        # initialize_traj came from the unified MPC topic, set this True
-        # so get_splini_wpts / get_recovery_wpts can choose NOT to pad
-        # with GB waypoints (user directive 2026-04-24 "mpc 출력 그대로").
-        self.from_mpc = False
-        self.closest_target = None
-        self.closest_gap = None
-        self.is_closed = is_closed
-        self.vel_planner_safety_factor = 1.0
-        self.dyn_sub = rospy.Subscriber(self.node_name + "/parameter_updates", Config, self.dyn_param_cb)
-        self.update_param()
-
-    def dyn_param_cb(self, config):
-        self.update_param()
-
-    def update_param(self):
-        self.min_horizon = rospy.get_param(self.node_name + "/min_horizon")
-        self.max_horizon = rospy.get_param(self.node_name + "/max_horizon")
-        self.lateral_width_m = rospy.get_param(self.node_name + "/lateral_width_m")
-        self.free_scaling_reference_distance_m = rospy.get_param(self.node_name + "/free_scaling_reference_distance_m")
-        self.latest_threshold = rospy.get_param(self.node_name + "/latest_threshold")
-        self.on_spline_front_horizon_thres_m = rospy.get_param(self.node_name + "/on_spline_front_horizon_thres_m")
-        self.on_spline_min_dist_thres_m = rospy.get_param(self.node_name + "/on_spline_min_dist_thres_m")
-        self.hyst_timer_sec = rospy.get_param(self.node_name + "/hyst_timer_sec")
-        self.killing_timer_sec = rospy.get_param(self.node_name + "/killing_timer_sec")
-            
-    def initialize_traj(self, wpnt):
-        if len(wpnt.wpnts) != 0:
-            self.stamp = wpnt.header.stamp
-            self.list = wpnt.wpnts
-            self.array = np.array([[wpnt.x_m, wpnt.y_m, wpnt.s_m, wpnt.d_m] for wpnt in wpnt.wpnts])
-            self.is_init = True
 
 class StateMachine:
     """
@@ -1373,49 +1332,22 @@ class StateMachine:
         obstacles = self.cur_obstacles_in_interest
         if wpnts_data.is_init:
             for obs in obstacles:
-                # if obs.is_static:
-                if True:
-                    obs_s = obs.s_center
-                    # Wrapping madness to check if infront
-                    gap = (obs_s - self.cur_s) % self.max_s
+                obs_s = obs.s_center
+                # 자차 기준 wrap-around gap
+                gap = (obs_s - self.cur_s) % self.max_s
 
-                    if gap < max_horizon or min_horizon < (gap - self.max_s):
-                        dists = np.linalg.norm(wpnts_data.array[:,0:2] - np.array([obs.x_m, obs.y_m]), axis=1)
-                        min_dist = np.min(dists)
-                        
-                        free_dist = min_dist - obs.size/2 - self.gb_ego_width_m /2
-                        
-                        scaling_factor = np.clip(gap / free_scaling_reference_distance_m, 0.0, 1.0)
+                if gap < max_horizon or min_horizon < (gap - self.max_s):
+                    dists = np.linalg.norm(wpnts_data.array[:, 0:2] - np.array([obs.x_m, obs.y_m]), axis=1)
+                    min_dist = np.min(dists)
+                    free_dist = min_dist - obs.size / 2 - self.gb_ego_width_m / 2
+                    scaling_factor = np.clip(gap / free_scaling_reference_distance_m, 0.0, 1.0)
 
-                        # rospy.logwarn(scaling_factor)
-                        if free_dist < lateral_width_m * scaling_factor:
-                            is_free = False
-                            if closest_obs is None or min_gap > gap:
-                                closest_obs = obs
-                                min_gap = gap
-                            rospy.loginfo(f"[{self.name}] RECOVERY_FREE False, obs dist to recovery lane: {min_dist} m")
-                else:
-                    pass
-                    # obs_s = obs.s_center
-                    # # Wrapping madness to check if infront
-                    # gap = (obs_s - self.cur_s) % self.max_s
-                    # if gap < horizon:
-                    #     obs_d = obs.d_center
-                    #     # Get d wrt to mincurv from the overtaking line
-                    #     avoid_wpnt_idx = np.argmin(
-                    #         np.array([abs(avoid_s.s_m - obs_s) for avoid_s in self.last_valid_avoidance_wpnts.wpnts])
-                    #     )
-                    #     ot_d = self.last_valid_avoidance_wpnts.wpnts[avoid_wpnt_idx].d_m
-                    #     ot_obs_dist = ot_d - obs_d
-                    #     # if abs(ot_obs_dist) - obs.size/2 < self.lateral_width_ot_m:
-                    #     if True:
-                    #         is_free = False
-                    #         rospy.loginfo("[State Machine] O_FREE False, obs dist to ot lane: {} m".format(ot_obs_dist))
-                    #         if closest_obs is None or min_gap > gap:
-                    #             closest_obs = obs
-                    #             min_gap = gap
-                    
-                    
+                    if free_dist < lateral_width_m * scaling_factor:
+                        is_free = False
+                        if closest_obs is None or min_gap > gap:
+                            closest_obs = obs
+                            min_gap = gap
+                        rospy.loginfo(f"[{self.name}] RECOVERY_FREE False, obs dist to recovery lane: {min_dist} m")
         else:
             is_free = True
         wpnts_data.closest_target = closest_obs
@@ -1593,17 +1525,16 @@ class StateMachine:
             ):
                 return True
         else:
-            if True:
-                if self._check_availability(self.avoidance_wpnts, self.cur_avoidance_wpnts):
-                    # ### HJ : 2026-04-25 — MPC paths use xy distance
-                    # (true Euclidean), legacy paths keep frenet d check.
-                    from_mpc = getattr(self.cur_avoidance_wpnts, 'from_mpc', False)
-                    if from_mpc and getattr(self, '_use_xy_clearance_check', True):
-                        if self._check_free_xy(self.cur_avoidance_wpnts):
-                            return True
-                    else:
-                        if self._check_free_frenet(self.cur_avoidance_wpnts):
-                            return True
+            if self._check_availability(self.avoidance_wpnts, self.cur_avoidance_wpnts):
+                # ### HJ : 2026-04-25 — MPC paths use xy distance
+                # (true Euclidean), legacy paths keep frenet d check.
+                from_mpc = getattr(self.cur_avoidance_wpnts, 'from_mpc', False)
+                if from_mpc and getattr(self, '_use_xy_clearance_check', True):
+                    if self._check_free_xy(self.cur_avoidance_wpnts):
+                        return True
+                else:
+                    if self._check_free_frenet(self.cur_avoidance_wpnts):
+                        return True
 
         return False
 
