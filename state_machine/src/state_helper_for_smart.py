@@ -1,266 +1,120 @@
 #!/usr/bin/env python3
-"""
-Smart Static State Helper
+"""SmartStaticChecker — Fixed Frenet 좌표계 기반 state checker.
 
-Provides Fixed Frenet-based state checking by inheriting StateMachine.
-Uses Fixed path (Smart Static) as reference instead of GB raceline.
+상속 + composition 혼합 패턴:
+- StateMachine 을 상속해 모든 check 함수 (`_check_close_to_raceline`, `_check_free_frenet`,
+  `_check_overtaking_mode_sustainability` 등) 를 그대로 사용한다.
+- 단 self.cur_s / cur_d / obstacles / cur_gb_wpnts 등 일부 attribute 만 Fixed Frenet
+  데이터로 override 한다 (생성 시 + `update()` 매 iteration 에서).
+- 그 외 attribute (rate_hz, n_loc_wpnts, pars, ftg_*, splini_*, ...) 는 모두
+  `__getattr__` 으로 parent 에서 동적으로 fallback. parent 에 새 attribute 가 추가돼도
+  자동으로 보임 — 옛 `self.__dict__.update(parent.__dict__)` 패턴이 가진 시한폭탄
+  (init 후 parent attribute 추가 시 동기화 깨짐) 을 제거.
 
 Usage:
     checker = SmartStaticChecker(state_machine)
-    checker.update()  # Extract Fixed Frenet from parent's obstacles
-    close = checker._check_close_to_raceline()  # Fixed Frenet based check
+    checker.update()                        # 매 iteration parent.update_waypoints() 가 호출
+    close = checker._check_close_to_raceline()  # Fixed Frenet 기반 check
 """
+
+import copy
 
 import rospy
 from nav_msgs.msg import Odometry
+
 from state_machine_node import StateMachine
 
 
 class SmartStaticChecker(StateMachine):
-    """StateMachine functions but with Fixed Frenet reference
-
-    Inherits all check functions from StateMachine.
-    Overrides instance variables (cur_s, cur_d, obstacles) with Fixed Frenet values.
-    Subscribes only to Fixed Frenet odom, reuses parent's obstacles and waypoints.
-    """
+    """StateMachine 의 check 함수를 Fixed Frenet 좌표계로 재사용한다."""
 
     def __init__(self, parent_state_machine):
-        """Initialize with Fixed Frenet reference
+        """parent (메인 StateMachine) 를 참조로 들고 Fixed Frenet override 만 set.
 
-        Args:
-            parent_state_machine: Main StateMachine instance (GB raceline based)
+        주의: 부모 `StateMachine.__init__` 은 호출하지 않는다. ROS 노드 중복 init 방지.
+        대신 부모의 모든 attribute / method 는 `__getattr__` 또는 상속으로 자동 사용.
         """
-        self.parent = parent_state_machine
+        # parent 는 __getattr__ 가 무한재귀 없이 접근할 수 있도록 __dict__ 에 직접 set
+        self.__dict__['parent'] = parent_state_machine
 
-        # ===== HJ MODIFIED: Copy ALL parent attributes, then override specific ones =====
-        # Copy all parent's attributes by reference (shallow copy of __dict__)
-        # This ensures all inherited methods have access to all needed variables
-        self.__dict__.update(parent_state_machine.__dict__)
+        # ── Fixed Frenet 전용 override (parent 의 GB Frenet 값을 가리지 않도록 helper 자체에 보유) ──
+        self.cur_s = 0.0
+        self.cur_d = 0.0
+        self.cur_vs = 0.0
+        self.cur_vd = 0.0
 
-        # Now override only the Fixed Frenet specific variables
-        self.cur_s = 0.0  # Progress along Fixed path (override)
-        self.cur_d = 0.0  # Lateral offset from Fixed path (override)
-        self.cur_vs = 0.0  # Velocity along Fixed path (override)
-        self.cur_vd = 0.0  # Lateral velocity along Fixed path (override)
+        # Fixed Frenet 으로 변환된 obstacle 리스트 (update() 가 매번 채움)
+        self.obstacles = []
+        self.obstacles_in_interest = []
+        self.cur_obstacles_in_interest = []
 
-        # Fixed path has its own obstacles_in_interest (override)
-        # Calculated in update() by filtering self.obstacles using Fixed Frenet
-        self.obstacles_in_interest = []  # Will be calculated based on Fixed Frenet s
-        self.cur_obstacles_in_interest = []  # Current obstacles in interest
+        # 모드 플래그 — parent 와 분리 (Smart helper 는 자체 OT 결정 가짐)
+        self.static_overtaking_mode = False
 
-        # ===== HJ ADDED: obstacles populated in update() from parent =====
-        # self.obstacles will be populated by update() with Fixed Frenet coordinates
-        # Reads parent's obstacles and copies _fixed fields to primary fields
-        self.obstacles = []  # Will be populated in update()
-        # ===== HJ ADDED END =====
-
-        # ===== HJ ADDED: Reset mode flags to avoid sharing with parent =====
-        # Note: Debug logging now uses global debug_log_on_change() with its own cache
-        self.static_overtaking_mode = False  # Independent overtaking flag
-        # ===== HJ ADDED END =====
-
-        # ===== HJ MODIFIED: Override waypoint-related variables for Fixed Frenet =====
-        # Waypoint data - use Smart Static waypoints as "gb_wpnts" (override)
+        # check 함수가 cur_gb_wpnts 로 base path 접근 → Smart helper 에선 Smart Static path
+        # cur_gb_wpnts 자체를 alias 로 — update() 가 매번 갱신
         self.cur_gb_wpnts = parent_state_machine.cur_smart_static_avoidance_wpnts
-        self.num_glb_wpnts = 0  # Will be updated in update()
-        self.waypoints_dist = 0.0  # Will be updated in update()
-        # track_length will be updated in update() to match Smart Static path length
-        # ===== HJ MODIFIED END =====
+        self.num_glb_wpnts = 0
+        self.waypoints_dist = 0.0
+        # max_s, track_length 는 update() 에서 Fixed path 길이로 설정
 
-        # ===== HJ ADDED: Dynamic waypoint references - always use parent's latest values =====
-        # These properties ensure we always get parent's latest waypoints (which are updated by callbacks)
-        # DO NOT create static copies - waypoints must dynamically reference parent
-        # The parent's callbacks update these, and we need live access to them
-        # ===== HJ ADDED END =====
-
-        # ===== HJ ADDED: Fixed Frenet odom subscriber (only this one needed!) =====
+        # Fixed Frenet odom — parent 의 GB odom 과 분리된 토픽
         rospy.Subscriber('/car_state/odom_frenet_fixed', Odometry, self._odom_fixed_cb)
         rospy.loginfo("[SmartStaticChecker] Initialized with Fixed Frenet odom subscription")
-        # ===== HJ ADDED END =====
-        # ===== HJ MODIFIED END =====
 
-        # ===== HJ NOTE: No timer needed - parent calls update() synchronously =====
-        # Parent's update_waypoints() calls self.smart_helper.update() directly
-        # This ensures perfect synchronization with parent's loop() timing
-        # ===== HJ NOTE END =====
+    def __getattr__(self, name):
+        """self / 클래스에 없는 attribute 는 parent 에서 자동 fallback.
 
-    # ===== HJ ADDED: Properties to dynamically access parent's callback-updated data =====
-    # Waypoint properties (for transitions and check functions)
-    @property
-    def static_avoidance_wpnts(self):
-        """Always return parent's latest static_avoidance_wpnts"""
-        return self.parent.static_avoidance_wpnts
+        효과: parent (StateMachine) 가 가진 모든 attribute (rate_hz, pars, ftg_*,
+        splini_*, recovery_wpnts, avoidance_wpnts, current_position, only_ftg_zones,
+        overtake_zones, obstacles_prediction, ego_prediction, ...) 를 helper 가
+        자동으로 사용 가능. parent 가 attribute 를 새로 추가해도 즉시 반영.
 
-    @property
-    def avoidance_wpnts(self):
-        """Always return parent's latest avoidance_wpnts"""
-        return self.parent.avoidance_wpnts
-
-    @property
-    def recovery_wpnts(self):
-        """Always return parent's latest recovery_wpnts"""
-        return self.parent.recovery_wpnts
-
-    # Prediction properties (for _check_free_frenet)
-    @property
-    def obstacles_prediction(self):
-        """Always return parent's latest obstacle predictions"""
-        return self.parent.obstacles_prediction
-
-    @property
-    def obstacles_prediction_id(self):
-        """Always return parent's latest obstacle prediction ID"""
-        return self.parent.obstacles_prediction_id
-
-    @property
-    def ego_prediction(self):
-        """Always return parent's latest ego prediction"""
-        return self.parent.ego_prediction
-
-    # Position property (for _check_close_to_raceline_heading, _check_on_spline)
-    @property
-    def current_position(self):
-        """Always return parent's latest cartesian position [x, y, heading]"""
-        return self.parent.current_position
-
-    # Zone properties (for _check_only_ftg_zone, _check_ot_sector)
-    @property
-    def only_ftg_zones(self):
-        """Always return parent's latest FTG-only zones"""
-        return self.parent.only_ftg_zones
-
-    @property
-    def overtake_zones(self):
-        """Always return parent's latest overtake zones"""
-        return self.parent.overtake_zones
-
-    # Dynamic config parameters (for check functions)
-    @property
-    def ftg_speed_mps(self):
-        """Always return parent's latest FTG speed threshold"""
-        return self.parent.ftg_speed_mps
-
-    @property
-    def ftg_timer_sec(self):
-        """Always return parent's latest FTG timer threshold"""
-        return self.parent.ftg_timer_sec
-
-    @property
-    def ftg_disabled(self):
-        """Always return parent's latest FTG disabled flag"""
-        return self.parent.ftg_disabled
-
-    @property
-    def gb_ego_width_m(self):
-        """Always return parent's latest ego vehicle width"""
-        return self.parent.gb_ego_width_m
-
-    @property
-    def lateral_width_gb_m(self):
-        """Always return parent's latest lateral width for GB"""
-        return self.parent.lateral_width_gb_m
-
-    @property
-    def lateral_width_ot_m(self):
-        """Always return parent's latest lateral width for overtaking"""
-        return self.parent.lateral_width_ot_m
-
-    @property
-    def overtaking_ttl_sec(self):
-        """Always return parent's latest overtaking TTL seconds"""
-        return self.parent.overtaking_ttl_sec
-
-    @property
-    def overtaking_ttl_count_threshold(self):
-        """Always return parent's latest overtaking TTL count threshold"""
-        return self.parent.overtaking_ttl_count_threshold
-
-    @property
-    def force_gbtrack_state(self):
-        """Always return parent's latest force GB track flag"""
-        return self.parent.force_gbtrack_state
-
-    @property
-    def use_force_trailing(self):
-        """Always return parent's latest use force trailing flag"""
-        return self.parent.use_force_trailing
-
-    @property
-    def emergency_break_horizon(self):
-        """Always return parent's latest emergency break horizon"""
-        return self.parent.emergency_break_horizon
-
-    @property
-    def splini_ttl(self):
-        """Always return parent's latest splini TTL"""
-        return self.parent.splini_ttl
-
-    @property
-    def splini_ttl_counter(self):
-        """Always return parent's latest splini TTL counter"""
-        return self.parent.splini_ttl_counter
-
-    @property
-    def splini_hyst_timer_sec(self):
-        """Always return parent's latest splini hysteresis timer"""
-        return self.parent.splini_hyst_timer_sec
-    # ===== HJ ADDED END =====
+        주의: __getattr__ 은 __dict__ + class hierarchy 모두 miss 일 때만 호출되므로
+        - cur_s / cur_d 등 helper 가 직접 set 한 attribute 는 helper 의 것 사용 (override)
+        - StateMachine 의 메서드들은 클래스 attribute 로 상속됨 (이 fallback 안 거침)
+        - 'parent' 자체 접근은 __dict__ hit 라 fallback 트리거 안 됨 (무한재귀 X)
+        """
+        # name='parent' 가 __dict__ 에서 못 찾는 비정상 상황 방어 (e.g. pickling)
+        if name == 'parent':
+            raise AttributeError("SmartStaticChecker has no 'parent' yet")
+        parent = object.__getattribute__(self, 'parent')
+        return getattr(parent, name)
 
     def _odom_fixed_cb(self, data):
-        """Fixed Frenet odom callback
-
-        Updates cur_s, cur_d, cur_vs, cur_vd from Fixed Frenet odom.
-        Overrides parent's GB Frenet values.
-        """
+        """Fixed Frenet odom callback — helper 자체의 cur_s/d/vs/vd override."""
         self.cur_s = data.pose.pose.position.x
         self.cur_d = data.pose.pose.position.y
         self.cur_vs = data.twist.twist.linear.x
         self.cur_vd = data.twist.twist.linear.y
 
     def update(self):
-        """Update waypoint metadata and obstacles in interest
+        """매 iteration parent.update_waypoints() 가 동기적으로 호출.
 
-        Called synchronously by parent's update_waypoints() every iteration.
-        Reads parent's obstacles, copies _fixed fields to primary fields,
-        and filters to get obstacles in interest.
+        (1) Smart Static path 메타데이터 갱신 (waypoint 수, 트랙 길이 등)
+        (2) parent 의 obstacles 를 Fixed Frenet 좌표로 변환
+        (3) interest_horizon_m 안의 obstacles 만 추려 obstacles_in_interest 에 저장
         """
         if len(self.parent.cur_smart_static_avoidance_wpnts.list) == 0:
-            # No Smart Static path available
+            # Smart Static path 아직 없음
             self.num_glb_wpnts = 0
             self.obstacles = []
             self.obstacles_in_interest = []
             self.cur_obstacles_in_interest = []
             return
 
-        # Update waypoint reference and metadata
+        # (1) waypoint 메타 갱신
         self.cur_gb_wpnts = self.parent.cur_smart_static_avoidance_wpnts
         self.num_glb_wpnts = len(self.cur_gb_wpnts.list)
+        self.track_length = self.cur_gb_wpnts.list[-1].s_m
+        self.waypoints_dist = self.track_length / self.num_glb_wpnts
+        # CRITICAL: max_s 도 Fixed path 길이여야 _check_free_frenet 의 wrap-around 가 맞음
+        self.max_s = self.track_length
 
-        # For closed loop, the last waypoint's s_m is the total track length
-        if self.num_glb_wpnts > 0:
-            self.track_length = self.cur_gb_wpnts.list[-1].s_m
-            # Calculate average waypoint distance (needed for _check_close_to_raceline_heading)
-            self.waypoints_dist = self.track_length / self.num_glb_wpnts
-
-            # ===== HJ CRITICAL: Override max_s with Fixed Frenet track length =====
-            # _check_free_frenet() and _check_free_cartesian() use self.max_s for modulo operations
-            # In Smart mode, self.cur_s is Fixed Frenet, so max_s MUST be Fixed path length
-            # Otherwise: gap = (obs_s - self.cur_s) % self.max_s uses wrong track length!
-            self.max_s = self.track_length
-            # ===== HJ CRITICAL END =====
-        else:
-            self.track_length = 0.0
-            self.waypoints_dist = 0.0
-            self.max_s = 0.0  # Reset when no path available
-
-        # Copy parent's obstacles and replace primary fields with _fixed fields
-        import copy
+        # (2) parent 의 obstacles → Fixed Frenet 좌표로 변환 (얕은 복사 + _fixed 필드 대체)
         self.obstacles = []
         for obs in self.parent.obstacles:
-            # Shallow copy to avoid modifying parent's obstacle
             obs_copy = copy.copy(obs)
-
-            # Replace primary Frenet fields with Fixed Frenet fields
             obs_copy.s_start = obs.s_start_fixed
             obs_copy.s_end = obs.s_end_fixed
             obs_copy.s_center = obs.s_center_fixed
@@ -273,26 +127,17 @@ class SmartStaticChecker(StateMachine):
             obs_copy.d_var = obs.d_var_fixed
             obs_copy.vs_var = obs.vs_var_fixed
             obs_copy.vd_var = obs.vd_var_fixed
-
             self.obstacles.append(obs_copy)
 
-        # Filter obstacles to get obstacles in interest
+        # (3) interest_horizon_m 안의 obstacle 만 추출
         self._update_obstacles_in_interest()
 
     def _update_obstacles_in_interest(self):
-        """Filter obstacles based on Fixed Frenet coordinates
-
-        Only includes obstacles within interest_horizon_m ahead on Fixed path.
-        Uses self.obstacles which was populated in update() with Fixed Frenet coordinates.
-        """
+        """Fixed Frenet 기반 obstacles_in_interest 필터링."""
         obstacles_in_interest = []
-
-        # Filter obstacles based on proximity to current Fixed Frenet s position
-        # Note: self.obstacles already has _fixed fields copied to primary fields
         for obs in self.obstacles:
             gap = (obs.s_start - self.cur_s) % self.track_length
             if gap < self.interest_horizon_m:
                 obstacles_in_interest.append(obs)
-
         self.obstacles_in_interest = obstacles_in_interest
         self.cur_obstacles_in_interest = obstacles_in_interest
