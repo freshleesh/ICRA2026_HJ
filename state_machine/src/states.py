@@ -1,83 +1,59 @@
+"""각 state 별로 local waypoint 리스트를 만드는 함수 모음.
+
+모든 함수는 state_machine 객체를 받아 List[Wpnt] (또는 빈 리스트)를 반환한다.
+state_machine_node 의 `self.states` 딕셔너리가 StateType -> 이 함수들로 매핑된다.
+"""
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, List
-from f110_msgs.msg import WpntArray, Wpnt
+from f110_msgs.msg import Wpnt
 
 if TYPE_CHECKING:
     from state_machine_node import StateMachine
 
-"""
-Here we define the behaviour in the different states.
-Every function should be fairly concise, and output an array of f110_msgs.Wpnt
-"""
+
 def GlobalTracking(state_machine: StateMachine) -> List[Wpnt]:
-    s = int(state_machine.cur_s/state_machine.waypoints_dist + 0.5)
-    return [state_machine.cur_gb_wpnts.list[(s + i)%state_machine.num_glb_wpnts] for i in range(state_machine.n_loc_wpnts)]
+    s = int(state_machine.cur_s / state_machine.waypoints_dist + 0.5)
+    return [
+        state_machine.cur_gb_wpnts.list[(s + i) % state_machine.num_glb_wpnts]
+        for i in range(state_machine.n_loc_wpnts)
+    ]
 
-# ===== ORIGINAL FUNCTION (before HJ modification) =====
-# def Overtaking(state_machine: StateMachine) -> List[Wpnt]:
-#     if (state_machine.ot_planner == "spliner" or state_machine.ot_planner == "predictive_spliner"):
-#         return state_machine.get_splini_wpts()
-#
-#     else:
-#         s = state_machine.cur_id_ot
-#         return [state_machine.overtake_wpnts[(s + i)%state_machine.num_ot_points] for i in range(state_machine.n_loc_wpnts)]
-# ===== ORIGINAL FUNCTION END =====
 
-# ===== HJ MODIFIED: Prioritize static obstacle avoidance regardless of ot_planner =====
 def Overtaking(state_machine: StateMachine) -> List[Wpnt]:
-    """Generate overtaking waypoints
+    """Overtaking waypoint 생성. Priority:
 
-    Priority order:
-    1. Static obstacle avoidance (static_overtaking_mode) - works with any planner
-    2. Dynamic obstacle avoidance with spliner
-    3. Pre-computed overtaking waypoints (fallback)
-
-    This ensures static obstacles are always avoided regardless of ot_planner choice.
+    1. 정적 장애물 회피 (`static_overtaking_mode`) — ot_planner 무관
+    2. spliner / predictive_spliner 동적 회피
+    3. 사전 계산된 overtake_wpnts (다른 planner fallback)
     """
-    # Priority 1: Static obstacle overtaking (regardless of ot_planner)
     if state_machine.static_overtaking_mode:
-        return state_machine.get_splini_wpts()  # Uses cur_static_avoidance_wpnts internally
+        return state_machine.get_splini_wpts()  # cur_static_avoidance_wpnts 사용
 
-    # Priority 2: Dynamic obstacle overtaking with spliner
-    if (state_machine.ot_planner == "spliner" or state_machine.ot_planner == "predictive_spliner"):
-        return state_machine.get_splini_wpts()  # Uses cur_avoidance_wpnts internally
+    if state_machine.ot_planner in ("spliner", "predictive_spliner"):
+        return state_machine.get_splini_wpts()  # cur_avoidance_wpnts 사용
 
-    # Priority 3: Pre-computed overtaking waypoints (other planners)
-    else:
-        s = state_machine.cur_id_ot
-        return [state_machine.overtake_wpnts[(s + i)%state_machine.num_ot_points] for i in range(state_machine.n_loc_wpnts)]
-# ===== HJ MODIFIED END =====
+    # 다른 planner (graph_based 등) — 사전 계산된 OT 라인 사용
+    s = state_machine.cur_id_ot
+    return [
+        state_machine.overtake_wpnts[(s + i) % state_machine.num_ot_points]
+        for i in range(state_machine.n_loc_wpnts)
+    ]
+
 
 def RECOVERY(state_machine: StateMachine):
     return state_machine.get_recovery_wpts()
 
+
 def START(state_machine: StateMachine):
     return state_machine.get_start_wpts()
 
+
 def FTGOnly(state_machine: StateMachine):
-    """No waypoints are generated in this follow the gap only state, all the control inputs are generated in the control node."""
+    """FTG-only state — 제어 입력은 control 노드가 직접 생성, wpnts 없음."""
     return []
 
+
 def SmartStatic(state_machine: StateMachine) -> List[Wpnt]:
-    """Smart static avoidance using GB optimizer fixed path."""
+    """Smart Static — GB optimizer fixed path 사용."""
     return state_machine.get_smart_static_wpts()
-
-# def TrailingAdaptive(state_machine: StateMachine, use_recovery_wpnts: bool) -> List[Wpnt]:
-#     # This allows us to trail on the last valid spline if necessary
-#     if not use_recovery_wpnts:
-#         return GlobalTracking(state_machine)
-#     else:
-#         return RECOVERY(state_machine)
-
-# def Trailing(state_machine: StateMachine) -> List[Wpnt]:
-#     # This allows us to trail on the last valid spline if necessary
-#     if (state_machine.ot_planner == "spliner" or state_machine.ot_planner == "predictive_spliner") and state_machine.last_valid_avoidance_wpnts is not None and len(state_machine.last_valid_avoidance_wpnts.wpnts) != 0:
-#         splini_wpts = state_machine.get_splini_wpts()
-#         s = int(state_machine.cur_s/state_machine.waypoints_dist + 0.5)
-#         # return [splini_wpts[(s + i)%state_machine.num_glb_wpnts] for i in range(state_machine.n_loc_wpnts)]
-#         return [state_machine.cur_gb_wpnts.list[(s + i)%state_machine.num_glb_wpnts] for i in range(state_machine.n_loc_wpnts)]
-#     else:
-#         s = int(state_machine.cur_s/state_machine.waypoints_dist + 0.5)
-#         return [state_machine.cur_gb_wpnts.list[(s + i)%state_machine.num_glb_wpnts] for i in range(state_machine.n_loc_wpnts)]
-

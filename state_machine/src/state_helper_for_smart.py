@@ -11,11 +11,9 @@ Usage:
     close = checker._check_close_to_raceline()  # Fixed Frenet based check
 """
 
-import numpy as np
 import rospy
 from nav_msgs.msg import Odometry
-from f110_msgs.msg import ObstacleArray, OTWpntArray
-from state_machine_node import StateMachine, debug_log_on_change, DEBUG_LOGGING_ENABLED
+from state_machine_node import StateMachine
 
 
 class SmartStaticChecker(StateMachine):

@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional, Tuple, List
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 from states_types import StateType
 import rospy
-from f110_msgs.msg import Wpnt
-import states
 
 
 if TYPE_CHECKING:
@@ -89,23 +87,15 @@ _debug_log_cache = {}
 DEBUG_LOGGING_ENABLED = False  # Set to False to disable all debug logging
 
 def debug_log_on_change(tag, **kwargs):
-    """Log only when any of the kwargs values change
+    """이전 호출과 kwargs 값이 다를 때만 로그.
 
-    Can be globally enabled/disabled via DEBUG_LOGGING_ENABLED flag.
-
-    Usage:
-        debug_log_on_change("MyTag", value1=x, value2=y, value3=z)
+    DEBUG_LOGGING_ENABLED 가 False 면 no-op. 캐시는 모듈 전역 dict (`_debug_log_cache`).
+    item 할당만 하므로 `global` 선언 필요 없음.
     """
-    global _debug_log_cache
-
-    # Skip if debug logging is disabled
     if not DEBUG_LOGGING_ENABLED:
         return
 
-    # Create cache key
     cache_key = tag
-
-    # Get previous values
     prev_values = _debug_log_cache.get(cache_key, None)
 
     # Check if any value changed
